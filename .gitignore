@@ -1,0 +1,19 @@
+# Build outputs
+sme2-kernels/build/
+ane-training/training/training_dynamic/train
+ane-training/bridge/libane_bridge.dylib
+ane-training/ane_int8_bench
+ane-training/probe_async_and_device
+ane-training/sram_probe
+ane-training/training/test_perf_stats
+ane-training/gpu_prefill_ane_decode
+
+# Training data & checkpoints
+*.bin
+
+# macOS
+.DS_Store
+
+# Node (sme2-kernels dashboard)
+node_modules/
+dist/

@@ -1,0 +1,5 @@
+torch
+safetensors
+transformers
+huggingface_hub
+numpy
