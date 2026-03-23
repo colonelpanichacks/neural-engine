@@ -602,10 +602,9 @@ int main(int argc, char *argv[]) {
                     free(local_dh1); free(local_dh3); free(capt_x2n);
                 });
 
-                // RMSNorm2 backward
+                // RMSNorm2 backward + residual add (fused — eliminates separate vDSP_vadd pass)
                 t0 = mach_absolute_time();
-                rmsnorm_bwd(dx2, gr->rms_ffn, dx_ffn, ac->x2, lw[L].rms_ffn, DIM, SEQ);
-                vDSP_vadd(dx2, 1, dy, 1, dx2, 1, (vDSP_Length)(SEQ*DIM));
+                rmsnorm_bwd_add(dx2, gr->rms_ffn, dx_ffn, ac->x2, lw[L].rms_ffn, DIM, SEQ, dy);
                 t_rms_bwd += tb_ms(mach_absolute_time() - t0);
 
                 // Residual scaling
@@ -751,10 +750,9 @@ int main(int argc, char *argv[]) {
                 io_read_dyn(dk.qkvBwd->ioOut, dx_attn, DIM, SEQ);
                 { double dt = tb_ms(mach_absolute_time() - t0); t_io_bwd += dt; io_bwd_qkv_r += dt; }
 
-                // RMSNorm1 backward
+                // RMSNorm1 backward + residual add (fused — output goes to dy)
                 t0 = mach_absolute_time();
-                rmsnorm_bwd(dx_rms1, gr->rms_att, dx_attn, ac->layer_in, lw[L].rms_att, DIM, SEQ);
-                vDSP_vadd(dx_rms1, 1, dx2, 1, dy, 1, (vDSP_Length)(SEQ*DIM));
+                rmsnorm_bwd_add(dy, gr->rms_att, dx_attn, ac->layer_in, lw[L].rms_att, DIM, SEQ, dx2);
                 t_rms_bwd += tb_ms(mach_absolute_time() - t0);
             }
 
