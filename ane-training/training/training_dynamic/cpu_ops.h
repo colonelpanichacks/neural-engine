@@ -491,18 +491,31 @@ static void gqa_reduce_kv_f16(_Float16 *out, const _Float16 *in, int seq) {
     }
 }
 
-// Parallel fp16 strided scatter: copies contiguous fp16 to strided IOSurface layout
+// Parallel fp16 strided scatter with non-temporal stores: multi-threaded STNP
+// bypasses read-for-ownership cache miss on write-only IOSurface data
 static void scatter_f16_par(_Float16 *dst, const _Float16 *src,
                             int channels, int seq, int stride, int sp_offset) {
     if (!g_scatter_q) g_scatter_q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
     const int BLOCK = 64;
     int nblocks = (channels + BLOCK - 1) / BLOCK;
+    int bytes = seq * 2;
     dispatch_apply((size_t)nblocks, g_scatter_q, ^(size_t b) {
         int ch_start = (int)b * BLOCK;
         int ch_end = ch_start + BLOCK;
         if (ch_end > channels) ch_end = channels;
         for (int ch = ch_start; ch < ch_end; ch++) {
-            memcpy(dst + ch * stride + sp_offset, src + ch * seq, seq * 2);
+            const uint8_t *s = (const uint8_t*)(src + ch * seq);
+            uint8_t *d = (uint8_t*)(dst + ch * stride + sp_offset);
+            int i = 0;
+            for (; i + 31 < bytes; i += 32) {
+                __asm__ volatile (
+                    "ldp q0, q1, [%0]   \n"
+                    "stnp q0, q1, [%1]  \n"
+                    : : "r"(s + i), "r"(d + i)
+                    : "v0", "v1", "memory"
+                );
+            }
+            for (; i < bytes; i++) d[i] = s[i];
         }
     });
 }
