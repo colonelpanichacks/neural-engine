@@ -90,6 +90,18 @@ static void cvt_scatter_f32_f16_par(_Float16 *dst, const float *src,
             _Float16 *d = dst + ch * stride + sp_offset;
             const float *s = src + ch * seq;
             int i = 0;
+            // STNP: convert 16 fp32 → 16 fp16 (32 bytes), non-temporal store pair
+            for (; i + 15 < seq; i += 16) {
+                float16x8_t h0 = vcombine_f16(vcvt_f16_f32(vld1q_f32(s + i)),
+                                               vcvt_f16_f32(vld1q_f32(s + i + 4)));
+                float16x8_t h1 = vcombine_f16(vcvt_f16_f32(vld1q_f32(s + i + 8)),
+                                               vcvt_f16_f32(vld1q_f32(s + i + 12)));
+                __asm__ volatile (
+                    "stnp q0, q1, [%0]"
+                    : : "r"(d + i), "w"(h0), "w"(h1)
+                    : "memory"
+                );
+            }
             for (; i + 7 < seq; i += 8) {
                 float16x8_t h = vcombine_f16(vcvt_f16_f32(vld1q_f32(s + i)),
                                               vcvt_f16_f32(vld1q_f32(s + i + 4)));
