@@ -514,26 +514,4 @@ static void scatter_f16_par(_Float16 *dst, const _Float16 *src,
     }
 }
 
-// Parallel fp16 strided scatter with write-prefetch hints instead of STNP:
-// prefetch next channel's destination before memcpy write to warm the cache line
-static void scatter_f16_par_pf(_Float16 *dst, const _Float16 *src,
-                               int channels, int seq, int stride, int sp_offset) {
-    if (!g_scatter_q) g_scatter_q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
-    const int BLOCK = 64;
-    int nblocks = (channels + BLOCK - 1) / BLOCK;
-    int bytes = seq * 2;
-    dispatch_apply((size_t)nblocks, g_scatter_q, ^(size_t b) {
-        int ch_start = (int)b * BLOCK;
-        int ch_end = ch_start + BLOCK;
-        if (ch_end > channels) ch_end = channels;
-        for (int ch = ch_start; ch < ch_end; ch++) {
-            const uint8_t *s = (const uint8_t*)(src + ch * seq);
-            uint8_t *d = (uint8_t*)(dst + ch * stride + sp_offset);
-            // Prefetch next channel's destination for write
-            if (ch + 1 < channels) {
-                __builtin_prefetch(dst + (ch + 1) * stride + sp_offset, 1, 0);
-            }
-            memcpy(d, s, bytes);
-        }
-    });
-}
+// (scatter_f16_par_pf removed — benchmarked 2x slower than serial STNP)
