@@ -20,6 +20,22 @@ static NSData *build_blob_fp16(_Float16 *d, int cnt) {
     return [NSData dataWithBytesNoCopy:b length:tot freeWhenDone:YES];
 }
 
+// Fused residual: out = alpha * fp16_to_fp32(src_fp16) + x, single pass
+// Eliminates separate cvt_f16_f32 + vDSP_vsma by fusing conversion into FMA
+static void residual_cvt_f16(float *out, const _Float16 *src_fp16, const float *x,
+                              float alpha, int n) {
+    float32x4_t va = vdupq_n_f32(alpha);
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        float16x8_t h = vld1q_f16((const __fp16*)(src_fp16 + i));
+        float32x4_t lo = vcvt_f32_f16(vget_low_f16(h));
+        float32x4_t hi = vcvt_f32_f16(vget_high_f16(h));
+        vst1q_f32(out + i,     vfmaq_f32(vld1q_f32(x + i),     va, lo));
+        vst1q_f32(out + i + 4, vfmaq_f32(vld1q_f32(x + i + 4), va, hi));
+    }
+    for (; i < n; i++) out[i] = alpha * (float)src_fp16[i] + x[i];
+}
+
 // NEON vectorized conversion
 static void cvt_f16_f32(float *dst, const _Float16 *src, int n) {
     int i = 0;
@@ -40,27 +56,63 @@ static void cvt_f32_f16(_Float16 *dst, const float *src, int n) {
     for (; i < n; i++) dst[i] = (_Float16)src[i];
 }
 
-// IOSurface I/O (channel-first [C,S] layout, fp16 on surface)
-static void io_read_fp16(IOSurfaceRef s, float *data, int ch_off, int channels, int sp) {
-    IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
-    cvt_f16_f32(data, (_Float16*)IOSurfaceGetBaseAddress(s) + ch_off * sp, channels * sp);
-    IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
-}
-// Read output from dynamic matmul kernel: [1, OC, 1, SEQ]
-static void io_read_dyn(IOSurfaceRef s, float *out, int oc, int seq) {
-    IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
-    cvt_f16_f32(out, (_Float16*)IOSurfaceGetBaseAddress(s), oc * seq);
-    IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+// Fused fp32→fp16 conversion + strided scatter into IOSurface [C,S] layout.
+// Eliminates intermediate fp16 staging buffers — converts and writes in one pass.
+// src: [channels, seq] fp32 contiguous. dst: [C, S] fp16, writing at dst[ch*stride + offset].
+static void cvt_scatter_f32_f16(_Float16 *dst, const float *src,
+                                 int channels, int seq, int stride, int sp_offset) {
+    for (int ch = 0; ch < channels; ch++) {
+        _Float16 *d = dst + ch * stride + sp_offset;
+        const float *s = src + ch * seq;
+        int i = 0;
+        for (; i + 7 < seq; i += 8) {
+            float16x8_t h = vcombine_f16(vcvt_f16_f32(vld1q_f32(s + i)),
+                                          vcvt_f16_f32(vld1q_f32(s + i + 4)));
+            vst1q_f16((__fp16*)(d + i), h);
+        }
+        for (; i < seq; i++) d[i] = (_Float16)s[i];
+    }
 }
 
-// Read fused output: [1, DIM+2*HIDDEN, 1, SEQ] → dx_ffn[DIM*SEQ], dh1[HIDDEN*SEQ], dh3[HIDDEN*SEQ]
+// Parallel version for large scatters (>512 channels). Uses dispatch_apply to spread
+// across P-cores. Block size tuned to amortize dispatch overhead vs cache thrashing.
+static dispatch_queue_t g_scatter_q = NULL;
+static void cvt_scatter_f32_f16_par(_Float16 *dst, const float *src,
+                                     int channels, int seq, int stride, int sp_offset) {
+    if (!g_scatter_q) g_scatter_q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
+    const int BLOCK = 64;  // channels per work unit
+    int nblocks = (channels + BLOCK - 1) / BLOCK;
+    dispatch_apply((size_t)nblocks, g_scatter_q, ^(size_t b) {
+        int ch_start = (int)b * BLOCK;
+        int ch_end = ch_start + BLOCK;
+        if (ch_end > channels) ch_end = channels;
+        for (int ch = ch_start; ch < ch_end; ch++) {
+            _Float16 *d = dst + ch * stride + sp_offset;
+            const float *s = src + ch * seq;
+            int i = 0;
+            for (; i + 7 < seq; i += 8) {
+                float16x8_t h = vcombine_f16(vcvt_f16_f32(vld1q_f32(s + i)),
+                                              vcvt_f16_f32(vld1q_f32(s + i + 4)));
+                vst1q_f16((__fp16*)(d + i), h);
+            }
+            for (; i < seq; i++) d[i] = (_Float16)s[i];
+        }
+    });
+}
+
+// IOSurface I/O (channel-first [C,S] layout, fp16 on surface)
+// No IOSurface locks — ANE eval call provides synchronization
+static void io_read_fp16(IOSurfaceRef s, float *data, int ch_off, int channels, int sp) {
+    cvt_f16_f32(data, (_Float16*)IOSurfaceGetBaseAddress(s) + ch_off * sp, channels * sp);
+}
+static void io_read_dyn(IOSurfaceRef s, float *out, int oc, int seq) {
+    cvt_f16_f32(out, (_Float16*)IOSurfaceGetBaseAddress(s), oc * seq);
+}
 static void io_read_ffn_bwd_fused(IOSurfaceRef s, float *dx_ffn, float *dh1, float *dh3) {
-    IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
     _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
     cvt_f16_f32(dx_ffn, buf, DIM*SEQ);
     cvt_f16_f32(dh1, buf + DIM*SEQ, HIDDEN*SEQ);
     cvt_f16_f32(dh3, buf + (DIM+HIDDEN)*SEQ, HIDDEN*SEQ);
-    IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
 }
 
 // Compile MIL to ANE kernel
@@ -96,6 +148,8 @@ static Kern *compile_kern_mil_w(NSString *mil, NSDictionary *weights, int ic_byt
         @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
         @[wI], @[@0], @[wO], @[@0], nil, nil, @0));
     k->tmpDir = (void*)CFBridgingRetain(td);
+    // Get underlying _ANEModel for evaluateRealTime
+    k->aneModel = (void*)CFBridgingRetain(((id(*)(id,SEL))objc_msgSend)(mdl, @selector(model)));
     return k;
     }
 }
@@ -105,16 +159,23 @@ static void free_kern(Kern *k) {
     ((BOOL(*)(id,SEL,unsigned int,NSError**))objc_msgSend)(mdl, @selector(unloadWithQoS:error:), 21, &e);
     CFRelease(k->ioIn); CFRelease(k->ioOut);
     [[NSFileManager defaultManager] removeItemAtPath:(__bridge id)k->tmpDir error:nil];
+    if (k->aneModel) CFRelease(k->aneModel);
     CFRelease(k->model); CFRelease(k->request); CFRelease(k->tmpDir);
     free(k);
 }
+// doEvaluateDirectWithModel: fastest dispatch path in real async training workload
+// (evaluateRealTimeWithModel is faster in serial benchmarks but ~14% slower with async dispatch)
 static void ane_eval(Kern *k) {
-    id mdl = (__bridge id)k->model; id req = (__bridge id)k->request; NSError *e = nil;
-    ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(mdl, @selector(evaluateWithQoS:options:request:error:), 21, @{}, req, &e);
+    id aneModel = (__bridge id)k->aneModel; id req = (__bridge id)k->request; NSError *e = nil;
+    ((BOOL(*)(id,SEL,id,id,id,unsigned int,NSError**))objc_msgSend)(
+        g_ane_client, @selector(doEvaluateDirectWithModel:options:request:qos:error:),
+        aneModel, @{}, req, 21, &e);
 }
 static void ane_eval_req(Kern *k, void *request) {
-    id mdl = (__bridge id)k->model; id req = (__bridge id)request; NSError *e = nil;
-    BOOL ok = ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(mdl, @selector(evaluateWithQoS:options:request:error:), 21, @{}, req, &e);
+    id aneModel = (__bridge id)k->aneModel; id req = (__bridge id)request; NSError *e = nil;
+    BOOL ok = ((BOOL(*)(id,SEL,id,id,id,unsigned int,NSError**))objc_msgSend)(
+        g_ane_client, @selector(doEvaluateDirectWithModel:options:request:qos:error:),
+        aneModel, @{}, req, 21, &e);
     if (!ok) printf("  [ANE EVAL FAIL] %s\n", e ? [[e description] UTF8String] : "no error");
 }
 // Async ANE eval: dispatch eval to dedicated queue, overlap CPU work
@@ -132,12 +193,14 @@ static dispatch_queue_t ane_dispatch_queue(void) {
 // Call ane_eval_wait(sem) when you need the result.
 static dispatch_semaphore_t ane_eval_req_async(Kern *k, void *request) {
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    id mdl = (__bridge id)k->model;
+    id aneModel = (__bridge id)k->aneModel;
     id req = (__bridge id)request;
+    id client = g_ane_client;
     dispatch_async(ane_dispatch_queue(), ^{
         NSError *e = nil;
-        ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(
-            mdl, @selector(evaluateWithQoS:options:request:error:), 21, @{}, req, &e);
+        ((BOOL(*)(id,SEL,id,id,id,unsigned int,NSError**))objc_msgSend)(
+            client, @selector(doEvaluateDirectWithModel:options:request:qos:error:),
+            aneModel, @{}, req, 21, &e);
         dispatch_semaphore_signal(sem);
     });
     return sem;
@@ -147,6 +210,20 @@ static dispatch_semaphore_t ane_eval_async(Kern *k) {
 }
 static void ane_eval_wait(dispatch_semaphore_t sem) {
     dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+}
+
+// Rebind a kernel's output IOSurface (for IOSurface sharing between kernels)
+// Replaces ioOut and rebuilds the default request with the new output surface
+static void rebind_kern_output(Kern *k, IOSurfaceRef newOut) {
+    CFRelease(k->ioOut);
+    k->ioOut = (IOSurfaceRef)CFRetain(newOut);
+    // Rebuild default request with new output
+    CFRelease(k->request);
+    id wI = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), k->ioIn);
+    id wO = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), k->ioOut);
+    k->request = (void*)CFBridgingRetain(((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(g_AR,
+        @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
+        @[wI], @[@0], @[wO], @[@0], nil, nil, @0));
 }
 
 static void *make_request(Kern *k, IOSurfaceRef ioIn) {
@@ -161,170 +238,158 @@ static void *make_request(Kern *k, IOSurfaceRef ioIn) {
 // ===== Per-layer weight staging for GQA =====
 // sdpaFwd: [1, DIM, 1, SEQ + Q_DIM + KV_DIM + KV_DIM] fp16 — no Wo (separate kernel)
 //   Wq: [DIM, Q_DIM], Wk: [DIM, KV_DIM], Wv: [DIM, KV_DIM]
-#define SDPA_FWD_SP (SEQ + Q_DIM + KV_DIM + KV_DIM)
-static void stage_sdpa_fwd_weights(IOSurfaceRef s, const float *Wq, const float *Wk, const float *Wv) {
-    IOSurfaceLock(s, 0, NULL);
+#define SDPA_FWD_SP (SEQ + Q_DIM + KV_DIM + KV_DIM + Q_DIM)
+static void stage_sdpa_fwd_weights(IOSurfaceRef s, const float *Wq, const float *Wk, const float *Wv, const float *Wo) {
     _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
-    for (int d = 0; d < DIM; d++) {
-        cvt_f32_f16(buf + d*SDPA_FWD_SP + SEQ,                   Wq + d*Q_DIM, Q_DIM);
-        cvt_f32_f16(buf + d*SDPA_FWD_SP + SEQ+Q_DIM,             Wk + d*KV_DIM, KV_DIM);
-        cvt_f32_f16(buf + d*SDPA_FWD_SP + SEQ+Q_DIM+KV_DIM,     Wv + d*KV_DIM, KV_DIM);
-    }
-    IOSurfaceUnlock(s, 0, NULL);
+    // Wq [DIM, Q_DIM] at sp[SEQ:SEQ+Q_DIM]
+    cvt_scatter_f32_f16(buf, Wq, DIM, Q_DIM, SDPA_FWD_SP, SEQ);
+    // Wk [DIM, KV_DIM] at sp[SEQ+Q_DIM:SEQ+Q_DIM+KV_DIM]
+    cvt_scatter_f32_f16(buf, Wk, DIM, KV_DIM, SDPA_FWD_SP, SEQ+Q_DIM);
+    // Wv [DIM, KV_DIM] at sp[SEQ+Q_DIM+KV_DIM:SEQ+Q_DIM+2*KV_DIM]
+    cvt_scatter_f32_f16(buf, Wv, DIM, KV_DIM, SDPA_FWD_SP, SEQ+Q_DIM+KV_DIM);
+    // Wo [DIM, Q_DIM] at sp[SEQ+Q_DIM+2*KV_DIM:SEQ+2*Q_DIM+2*KV_DIM]
+    cvt_scatter_f32_f16(buf, Wo, DIM, Q_DIM, SDPA_FWD_SP, SEQ+Q_DIM+2*KV_DIM);
 }
+// Fused version: xnorm is fp32 (converted+scattered in one pass)
 static void write_sdpa_fwd_acts(IOSurfaceRef s, const float *xnorm) {
-    IOSurfaceLock(s, 0, NULL);
     _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
-    for (int d = 0; d < DIM; d++)
-        cvt_f32_f16(buf + d*SDPA_FWD_SP, xnorm + d*SEQ, SEQ);
-    IOSurfaceUnlock(s, 0, NULL);
-}
-
-// woFwd: [1, Q_DIM, 1, SEQ + DIM] fp16 — Wo: [Q_DIM, DIM]
-#define WO_FWD_SP (SEQ + DIM)
-static void stage_wo_fwd_weights(IOSurfaceRef s, const float *Wo) {
-    IOSurfaceLock(s, 0, NULL);
-    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
-    for (int d = 0; d < Q_DIM; d++)
-        cvt_f32_f16(buf + d*WO_FWD_SP + SEQ, Wo + d*DIM, DIM);
-    IOSurfaceUnlock(s, 0, NULL);
-}
-// Direct fp16 copy: attn_out from sdpaFwd output → woFwd input (strided)
-// sdpaFwd output is contiguous [Q_DIM*SEQ], woFwd input has stride WO_FWD_SP
-static void copy_attn_out_fp16(IOSurfaceRef wo_in, const _Float16 *sdpa_out) {
-    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(wo_in);
-    for (int d = 0; d < Q_DIM; d++)
-        memcpy(buf + d*WO_FWD_SP, sdpa_out + d*SEQ, SEQ*2);
+    cvt_scatter_f32_f16_par(buf, xnorm, DIM, SEQ, SDPA_FWD_SP, 0);
 }
 
 // ffnFused: [1, DIM, 1, 2*SEQ+3*HIDDEN] fp16
 #define FFN_FUSED_SP (2*SEQ + 3*HIDDEN)
 static void stage_ffn_fused_weights(IOSurfaceRef s,
                                      const float *W1t, const float *W3t, const float *W2_orig) {
-    IOSurfaceLock(s, 0, NULL);
     _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
-    for (int d = 0; d < DIM; d++) {
-        cvt_f32_f16(buf + d*FFN_FUSED_SP + 2*SEQ,          W1t + d*HIDDEN, HIDDEN);
-        cvt_f32_f16(buf + d*FFN_FUSED_SP + 2*SEQ+HIDDEN,   W3t + d*HIDDEN, HIDDEN);
-        cvt_f32_f16(buf + d*FFN_FUSED_SP + 2*SEQ+2*HIDDEN, W2_orig + d*HIDDEN, HIDDEN);
-    }
-    IOSurfaceUnlock(s, 0, NULL);
+    cvt_scatter_f32_f16(buf, W1t, DIM, HIDDEN, FFN_FUSED_SP, 2*SEQ);
+    cvt_scatter_f32_f16(buf, W3t, DIM, HIDDEN, FFN_FUSED_SP, 2*SEQ+HIDDEN);
+    cvt_scatter_f32_f16(buf, W2_orig, DIM, HIDDEN, FFN_FUSED_SP, 2*SEQ+2*HIDDEN);
 }
+// Fused version: x2norm and x2 are fp32 (converted+scattered in one pass)
 static void write_ffn_fused_acts(IOSurfaceRef s, const float *x2norm, const float *x2) {
-    IOSurfaceLock(s, 0, NULL);
     _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
-    for (int d = 0; d < DIM; d++) {
-        cvt_f32_f16(buf + d*FFN_FUSED_SP,       x2norm + d*SEQ, SEQ);
-        cvt_f32_f16(buf + d*FFN_FUSED_SP + SEQ, x2 + d*SEQ, SEQ);
-    }
-    IOSurfaceUnlock(s, 0, NULL);
+    cvt_scatter_f32_f16_par(buf, x2norm, DIM, SEQ, FFN_FUSED_SP, 0);
+    cvt_scatter_f32_f16_par(buf, x2, DIM, SEQ, FFN_FUSED_SP, SEQ);
 }
 
-// ffnBwdW2t: [1, DIM, 1, SEQ+HIDDEN] fp16
-#define FFN_BWD_W2T_SP (SEQ + HIDDEN)
-static void stage_ffn_bwd_w2t_weights(IOSurfaceRef s, const float *W2) {
-    IOSurfaceLock(s, 0, NULL);
+// ffnBwdFull: [1, HIDDEN, 1, 3*SEQ+3*DIM] fp16 — fully fused W2^T + SiLU bwd + W1^T/W3^T
+// Replaces separate ffnBwdW2t + ffnBwdFused. dsilu_raw stays on ANE.
+//   sp[0:SEQ]               = dffn [DIM, SEQ] (only channels 0:DIM used)
+//   sp[SEQ:SEQ+DIM]         = W2^T [HIDDEN, DIM] (transposed weight)
+//   sp[SEQ+DIM:SEQ+DIM+SEQ] = h1 [HIDDEN, SEQ]
+//   sp[SEQ+DIM+SEQ:SEQ+DIM+2S] = h3 [HIDDEN, SEQ]
+//   sp[SEQ+DIM+2S:SEQ+2D+2S]   = W1 [HIDDEN, DIM]
+//   sp[SEQ+2D+2S:SEQ+3D+2S]    = W3 [HIDDEN, DIM]
+#define FFN_BWD_FULL_SP (3*SEQ + 3*DIM)
+// W2t is W2^T [HIDDEN, DIM] already transposed (from transpose_weight in Adam update)
+static void stage_ffn_bwd_full_weights(IOSurfaceRef s, const float *W2t, const float *W1, const float *W3) {
     _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
-    for (int d = 0; d < DIM; d++)
-        cvt_f32_f16(buf + d*FFN_BWD_W2T_SP + SEQ, W2 + d*HIDDEN, HIDDEN);
-    IOSurfaceUnlock(s, 0, NULL);
+    // W2^T at sp[SEQ:SEQ+DIM]: W2t is already [HIDDEN, DIM] row-major
+    cvt_scatter_f32_f16(buf, W2t, HIDDEN, DIM, FFN_BWD_FULL_SP, SEQ);
+    // W1 at sp[SEQ+DIM+2*SEQ:SEQ+2*DIM+2*SEQ]
+    cvt_scatter_f32_f16(buf, W1, HIDDEN, DIM, FFN_BWD_FULL_SP, SEQ+DIM+2*SEQ);
+    // W3 at sp[SEQ+2*DIM+2*SEQ:SEQ+3*DIM+2*SEQ]
+    cvt_scatter_f32_f16(buf, W3, HIDDEN, DIM, FFN_BWD_FULL_SP, SEQ+2*DIM+2*SEQ);
 }
-static void write_ffn_bwd_w2t_acts(IOSurfaceRef s, const float *dffn) {
-    IOSurfaceLock(s, 0, NULL);
+// Full version: dffn + h1 + h3 (used when h1/h3 not pre-staged)
+static void write_ffn_bwd_full_acts(IOSurfaceRef s, const float *dffn,
+                                     const _Float16 *h1_fp16, const _Float16 *h3_fp16) {
     _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
-    for (int d = 0; d < DIM; d++)
-        cvt_f32_f16(buf + d*FFN_BWD_W2T_SP, dffn + d*SEQ, SEQ);
-    IOSurfaceUnlock(s, 0, NULL);
+    cvt_scatter_f32_f16(buf, dffn, DIM, SEQ, FFN_BWD_FULL_SP, 0);
+    for (int h = 0; h < HIDDEN; h++)
+        memcpy(buf + h*FFN_BWD_FULL_SP + SEQ+DIM, h1_fp16 + h*SEQ, SEQ*2);
+    for (int h = 0; h < HIDDEN; h++)
+        memcpy(buf + h*FFN_BWD_FULL_SP + SEQ+DIM+SEQ, h3_fp16 + h*SEQ, SEQ*2);
 }
-
-// ffnBwdW13t: [1, HIDDEN, 1, 2*SEQ+2*DIM] fp16
-#define FFN_BWD_W13T_SP (2*SEQ + 2*DIM)
-static void stage_ffn_bwd_w13t_weights(IOSurfaceRef s, const float *W1, const float *W3) {
-    IOSurfaceLock(s, 0, NULL);
+// dffn-only version: h1/h3 already pre-staged during forward pass
+static void write_ffn_bwd_dffn_only(IOSurfaceRef s, const float *dffn) {
     _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
-    for (int d = 0; d < HIDDEN; d++) {
-        cvt_f32_f16(buf + d*FFN_BWD_W13T_SP + 2*SEQ,       W1 + d*DIM, DIM);
-        cvt_f32_f16(buf + d*FFN_BWD_W13T_SP + 2*SEQ + DIM, W3 + d*DIM, DIM);
+    cvt_scatter_f32_f16_par(buf, dffn, DIM, SEQ, FFN_BWD_FULL_SP, 0);
+}
+// Pre-stage h1/h3 into ffnBwdFull input from ffnFused output (called async during forward)
+static void prestage_ffn_bwd_h1h3(IOSurfaceRef bwd_in, const _Float16 *ffn_out) {
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(bwd_in);
+    const _Float16 *h1_src = ffn_out + DIM*SEQ;
+    const _Float16 *h3_src = ffn_out + (DIM+HIDDEN)*SEQ;
+    for (int h = 0; h < HIDDEN; h++) {
+        memcpy(buf + h*FFN_BWD_FULL_SP + SEQ+DIM, h1_src + h*SEQ, SEQ*2);
+        memcpy(buf + h*FFN_BWD_FULL_SP + SEQ+DIM+SEQ, h3_src + h*SEQ, SEQ*2);
     }
-    IOSurfaceUnlock(s, 0, NULL);
-}
-
-#define FFN_BWD_FUSED_SP (3*SEQ + 2*DIM)
-// ffnBwdFused: [1, HIDDEN, 1, 3*SEQ+2*DIM] fp16 — SiLU backward + W13t matmul
-// Replaces separate ffnBwdW13t + CPU SiLU backward
-static void stage_ffn_bwd_fused_weights(IOSurfaceRef s, const float *W1, const float *W3) {
-    IOSurfaceLock(s, 0, NULL);
-    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
-    for (int d = 0; d < HIDDEN; d++) {
-        cvt_f32_f16(buf + d*FFN_BWD_FUSED_SP + 3*SEQ,       W1 + d*DIM, DIM);
-        cvt_f32_f16(buf + d*FFN_BWD_FUSED_SP + 3*SEQ + DIM, W3 + d*DIM, DIM);
-    }
-    IOSurfaceUnlock(s, 0, NULL);
 }
 // wotBwd: [1, DIM, 1, SEQ+Q_DIM] fp16 — Wo is [DIM, Q_DIM], matmul gives Wo^T @ dy
 #define WOT_BWD_SP (SEQ + Q_DIM)
 static void stage_wot_bwd_weights(IOSurfaceRef s, const float *Wo) {
-    IOSurfaceLock(s, 0, NULL);
     _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
-    for (int d = 0; d < DIM; d++)
-        cvt_f32_f16(buf + d*WOT_BWD_SP + SEQ, Wo + d*Q_DIM, Q_DIM);
-    IOSurfaceUnlock(s, 0, NULL);
+    cvt_scatter_f32_f16(buf, Wo, DIM, Q_DIM, WOT_BWD_SP, SEQ);
 }
+// Fused version: dy is fp32 (converted+scattered in one pass)
 static void write_wot_bwd_acts(IOSurfaceRef s, const float *dy) {
-    IOSurfaceLock(s, 0, NULL);
     _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
-    for (int d = 0; d < DIM; d++)
-        cvt_f32_f16(buf + d*WOT_BWD_SP, dy + d*SEQ, SEQ);
-    IOSurfaceUnlock(s, 0, NULL);
+    cvt_scatter_f32_f16_par(buf, dy, DIM, SEQ, WOT_BWD_SP, 0);
 }
 
-// qBwd: [1, Q_DIM, 1, SEQ+DIM] fp16 — Wq is [Q_DIM, DIM], matmul gives Wq^T @ dq
-#define Q_BWD_SP (SEQ + DIM)
-static void stage_q_bwd_weights(IOSurfaceRef s, const float *Wq) {
-    IOSurfaceLock(s, 0, NULL);
+#define WOT_SDPA_BWD1_SP (4*SEQ + Q_DIM)
+// wotSdpaBwd1 FUSED: [1, Q_DIM, 1, 4*SEQ+Q_DIM] fp16
+// Wo weight at sp[SEQ:SEQ+Q_DIM] (first DIM channels), pre-staged once
+// Per-step: dx2_scaled at sp[0:SEQ], Q/K/V at sp[SEQ+Q_DIM:4*SEQ+Q_DIM]
+static void stage_wot_sdpa_bwd1_weights(IOSurfaceRef s, const float *Wo) {
     _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
-    for (int d = 0; d < Q_DIM; d++)
-        cvt_f32_f16(buf + d*Q_BWD_SP + SEQ, Wq + d*DIM, DIM);
-    IOSurfaceUnlock(s, 0, NULL);
+    // Wo [DIM, Q_DIM] at sp[SEQ:SEQ+Q_DIM], first DIM channels
+    cvt_scatter_f32_f16(buf, Wo, DIM, Q_DIM, WOT_SDPA_BWD1_SP, SEQ);
 }
-static void write_q_bwd_acts(IOSurfaceRef s, const float *dq) {
-    IOSurfaceLock(s, 0, NULL);
+// Write dx2_scaled activation for the wotBwd part
+static void write_wot_sdpa_bwd1_acts(IOSurfaceRef s, const float *dx2_scaled) {
     _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
-    for (int d = 0; d < Q_DIM; d++)
-        cvt_f32_f16(buf + d*Q_BWD_SP, dq + d*SEQ, SEQ);
-    IOSurfaceUnlock(s, 0, NULL);
+    // dx2_scaled [DIM, SEQ] at sp[0:SEQ], first DIM channels
+    cvt_scatter_f32_f16_par(buf, dx2_scaled, DIM, SEQ, WOT_SDPA_BWD1_SP, 0);
+}
+// Pre-stage Q/K_tiled/V_tiled (called during overlap with previous ANE kernel)
+static void prestage_wot_sdpa_bwd1_qkv(IOSurfaceRef s,
+                                         const _Float16 *Q_fp16,
+                                         const _Float16 *k_tiled_fp16,
+                                         const _Float16 *v_tiled_fp16) {
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    int sp = WOT_SDPA_BWD1_SP;
+    // Q at sp[SEQ+Q_DIM:2*SEQ+Q_DIM] — all Q_DIM channels
+    for (int ch = 0; ch < Q_DIM; ch++)
+        memcpy(buf + ch*sp + SEQ+Q_DIM, Q_fp16 + ch*SEQ, SEQ*2);
+    // K_tiled at sp[2*SEQ+Q_DIM:3*SEQ+Q_DIM]
+    for (int ch = 0; ch < Q_DIM; ch++)
+        memcpy(buf + ch*sp + 2*SEQ+Q_DIM, k_tiled_fp16 + ch*SEQ, SEQ*2);
+    // V_tiled at sp[3*SEQ+Q_DIM:4*SEQ+Q_DIM]
+    for (int ch = 0; ch < Q_DIM; ch++)
+        memcpy(buf + ch*sp + 3*SEQ+Q_DIM, v_tiled_fp16 + ch*SEQ, SEQ*2);
 }
 
-// kvBwd: [1, KV_DIM, 1, 2*SEQ+2*DIM] fp16 — dk @ Wk + dv @ Wv → dx_kv
-#define KV_BWD_SP (2*SEQ + 2*DIM)
-static void stage_kv_bwd_weights(IOSurfaceRef s, const float *Wk, const float *Wv) {
-    IOSurfaceLock(s, 0, NULL);
+// qkvBwd: fused dq@Wq + dk@Wk + dv@Wv → dx_attn (single kernel, single output)
+// Input: [1, Q_DIM, 1, 3*SEQ+3*DIM] fp16
+//   sp[0:SEQ]                    = dq [Q_DIM, SEQ]
+//   sp[SEQ:SEQ+DIM]              = Wq [Q_DIM, DIM] (pre-staged)
+//   sp[SEQ+DIM:SEQ+DIM+SEQ]      = dk [KV_DIM, SEQ] (channels 0:KV_DIM only)
+//   sp[SEQ+DIM+SEQ:SEQ+DIM+2S]   = dv [KV_DIM, SEQ] (channels 0:KV_DIM only)
+//   sp[SEQ+DIM+2S:SEQ+2D+2S]     = Wk [KV_DIM, DIM] (pre-staged)
+//   sp[SEQ+2D+2S:SEQ+3D+2S]      = Wv [KV_DIM, DIM] (pre-staged)
+// Output: [1, DIM, 1, SEQ] fp16 = dx_q + dx_k + dx_v (summed)
+#define QKV_BWD_SP (3*SEQ + 3*DIM)
+static void stage_qkv_bwd_weights(IOSurfaceRef s, const float *Wq, const float *Wk, const float *Wv) {
     _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
-    for (int d = 0; d < KV_DIM; d++) {
-        cvt_f32_f16(buf + d*KV_BWD_SP + 2*SEQ,       Wk + d*DIM, DIM);
-        cvt_f32_f16(buf + d*KV_BWD_SP + 2*SEQ + DIM, Wv + d*DIM, DIM);
-    }
-    IOSurfaceUnlock(s, 0, NULL);
+    cvt_scatter_f32_f16(buf, Wq, Q_DIM, DIM, QKV_BWD_SP, SEQ);
+    cvt_scatter_f32_f16(buf, Wk, KV_DIM, DIM, QKV_BWD_SP, SEQ+DIM+2*SEQ);
+    cvt_scatter_f32_f16(buf, Wv, KV_DIM, DIM, QKV_BWD_SP, SEQ+2*DIM+2*SEQ);
 }
-static void write_kv_bwd_acts(IOSurfaceRef s, const float *dk, const float *dv) {
-    IOSurfaceLock(s, 0, NULL);
+// Pre-stage dv into qkvBwd input (called during sdpaBwd2 ANE overlap)
+static void prestage_qkv_bwd_dv(IOSurfaceRef s, const float *dv) {
     _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
-    for (int d = 0; d < KV_DIM; d++) {
-        cvt_f32_f16(buf + d*KV_BWD_SP,       dk + d*SEQ, SEQ);
-        cvt_f32_f16(buf + d*KV_BWD_SP + SEQ, dv + d*SEQ, SEQ);
-    }
-    IOSurfaceUnlock(s, 0, NULL);
+    cvt_scatter_f32_f16_par(buf, dv, KV_DIM, SEQ, QKV_BWD_SP, SEQ+DIM+SEQ);
 }
 
 // Free per-layer surfaces and requests
 static void free_per_layer(PerLayerSurfaces *pls, PerLayerRequests *plr) {
     for (int L = 0; L < NLAYERS; L++) {
-        CFRelease(pls[L].sdpaFwd_in); CFRelease(pls[L].woFwd_in); CFRelease(pls[L].ffnFused_in);
-        CFRelease(pls[L].ffnBwdW2t_in); CFRelease(pls[L].ffnBwdW13t_in);
-        CFRelease(pls[L].wotBwd_in); CFRelease(pls[L].qBwd_in); CFRelease(pls[L].kvBwd_in);
-        CFRelease(plr[L].sdpaFwd); CFRelease(plr[L].woFwd); CFRelease(plr[L].ffnFused);
-        CFRelease(plr[L].ffnBwdW2t); CFRelease(plr[L].ffnBwdW13t);
-        CFRelease(plr[L].wotBwd); CFRelease(plr[L].qBwd); CFRelease(plr[L].kvBwd);
+        CFRelease(pls[L].sdpaFwd_in); CFRelease(pls[L].ffnFused_in);
+        CFRelease(pls[L].ffnBwdFull_in); CFRelease(pls[L].wotBwd_in); CFRelease(pls[L].qkvBwd_in);
+        CFRelease(plr[L].sdpaFwd); CFRelease(plr[L].ffnFused);
+        CFRelease(plr[L].ffnBwdFull); CFRelease(plr[L].wotBwd); CFRelease(plr[L].qkvBwd);
     }
 }
 

@@ -17,3 +17,13 @@ ane-training/gpu_prefill_ane_decode
 # Node (sme2-kernels dashboard)
 node_modules/
 dist/
+
+# Compiled probe binaries
+ane-training/probe_*
+!ane-training/probe_*.m
+ane-training/bench_*
+!ane-training/bench_*.m
+ane-training/test_*
+!ane-training/test_*.m
+ane-training/training/training_dynamic/chain_probe
+ane-training/training/training_dynamic/train_stories

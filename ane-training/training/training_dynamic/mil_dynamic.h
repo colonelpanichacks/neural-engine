@@ -1,6 +1,6 @@
 // mil_dynamic.h — MIL generators for Qwen3-0.6B with GQA
 // Q_DIM=2048 != DIM=1024, KV_DIM=1024, GQA_RATIO=2
-// SDPA split: sdpaFwd (QKV proj + attention, no Wo) + woFwd (Wo matmul)
+// sdpaFwd: QKV proj + attention + Wo projection (fused)
 // Backward: qBwd + kvBwd (split from qkvBwd)
 #pragma once
 #include "io.h"
@@ -45,18 +45,19 @@ static NSString *gen_dyn_matmul_mil(int ic, int oc, int seq) {
     return m;
 }
 
-// ===== SDPA forward with GQA (no Wo) =====
-// Input: [1, DIM, 1, SEQ + Q_DIM + KV_DIM + KV_DIM] fp16
-//   sp[0:SEQ]                     = xnorm [DIM, SEQ]
-//   sp[SEQ:SEQ+Q_DIM]             = Wq [DIM, Q_DIM]
-//   sp[SEQ+Q_DIM:SEQ+Q_DIM+KVD]  = Wk [DIM, KV_DIM]
-//   sp[SEQ+Q_DIM+KVD:...]         = Wv [DIM, KV_DIM]
-// Output: [1, Q_DIM+Q_DIM+KV_DIM+KV_DIM+DIM, 1, SEQ] fp16
-//   = concat(attn_out, Q_rope, K_rope, V, xnorm_pass)
+// ===== SDPA forward with GQA + Wo projection (fused) =====
+// Input: [1, DIM, 1, SEQ + Q_DIM + KV_DIM + KV_DIM + Q_DIM] fp16
+//   sp[0:SEQ]                               = xnorm [DIM, SEQ]
+//   sp[SEQ:SEQ+Q_DIM]                       = Wq [DIM, Q_DIM]
+//   sp[SEQ+Q_DIM:SEQ+Q_DIM+KVD]             = Wk [DIM, KV_DIM]
+//   sp[SEQ+Q_DIM+KVD:SEQ+Q_DIM+2*KVD]       = Wv [DIM, KV_DIM]
+//   sp[SEQ+Q_DIM+2*KVD:SEQ+2*Q_DIM+2*KVD]   = Wo^T [DIM, Q_DIM]
+// Output: [1, DIM+Q_DIM+Q_DIM+KV_DIM+KV_DIM, 1, SEQ] fp16
+//   = concat(o_out, attn_out, Q_rope, K_rope, V)
 static NSString *gen_sdpa_fwd_dynamic(void) {
     float sc = 1.0f/sqrtf((float)HD);
     int sp_in = SDPA_FWD_SP;
-    int out_ch = Q_DIM + Q_DIM + KV_DIM + KV_DIM + DIM;
+    int out_ch = DIM + Q_DIM + Q_DIM + KV_DIM + KV_DIM;
     NSMutableString *m = [NSMutableString string];
     [m appendString:MIL_HDR];
     [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n", DIM, sp_in];
@@ -200,22 +201,36 @@ static NSString *gen_sdpa_fwd_dynamic(void) {
     [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> at = transpose(perm=pm,x=a4)[name=string(\"ta\")];\n", HEADS, HD, SEQ];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> af = reshape(shape=qsh,x=at)[name=string(\"ra\")];\n", Q_DIM, SEQ];
 
+    // Wo projection: attn_out @ Wo → o_out [DIM, SEQ]
+    // Wo^T is packed at sp[SEQ+Q_DIM+2*KV_DIM:SEQ+2*Q_DIM+2*KV_DIM] as [DIM, Q_DIM]
+    [m appendFormat:@"        tensor<int32, [4]> bwo = const()[name=string(\"bwo\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", SEQ+Q_DIM+2*KV_DIM];
+    [m appendFormat:@"        tensor<int32, [4]> swo = const()[name=string(\"swo\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", DIM, Q_DIM];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> WoT = slice_by_size(x=x,begin=bwo,size=swo)[name=string(\"WoT\")];\n", DIM, Q_DIM];
+    // Reshape for matmul: WoT [1,DIM,1,Q_DIM] → [1,1,DIM,Q_DIM] → transpose → [1,1,Q_DIM,DIM]
+    [m appendFormat:@"        tensor<int32, [4]> rwo = const()[name=string(\"rwo\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n", DIM, Q_DIM];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> Wo2 = reshape(shape=rwo,x=WoT)[name=string(\"Wo2\")];\n", DIM, Q_DIM];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> Wo = transpose(perm=pm,x=Wo2)[name=string(\"Wo\")];\n", Q_DIM, DIM];
+    // attn_out [1,Q_DIM,1,SEQ] → [1,1,Q_DIM,SEQ] → [1,1,SEQ,Q_DIM]
+    [m appendFormat:@"        tensor<int32, [4]> raq = const()[name=string(\"raq\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n", Q_DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> af2 = reshape(shape=raq,x=af)[name=string(\"af2\")];\n", Q_DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> aft = transpose(perm=pm,x=af2)[name=string(\"aft\")];\n", SEQ, Q_DIM];
+    // matmul: [1,1,SEQ,Q_DIM] @ [1,1,Q_DIM,DIM] → [1,1,SEQ,DIM]
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> om = matmul(transpose_x=bF,transpose_y=bF,x=aft,y=Wo)[name=string(\"om\")];\n", SEQ, DIM];
+    // Reshape to [1,DIM,1,SEQ]
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> ot = transpose(perm=pm,x=om)[name=string(\"ot\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<int32, [4]> rod = const()[name=string(\"rod\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> of = reshape(shape=rod,x=ot)[name=string(\"of\")];\n", DIM, SEQ];
+
     // Convert RoPE'd Q,K back to flat layout for backward
     [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> qrt = transpose(perm=pm,x=q_rope)[name=string(\"qrt\")];\n", HEADS, HD, SEQ];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> qrf = reshape(shape=qsh,x=qrt)[name=string(\"qrf\")];\n", Q_DIM, SEQ];
     [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> krt = transpose(perm=pm,x=k_rope)[name=string(\"krt\")];\n", KV_HEADS, HD, SEQ];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> krf = reshape(shape=kvsh,x=krt)[name=string(\"krf\")];\n", KV_DIM, SEQ];
 
-    // Output: concat(attn_out[Q_DIM], Q_rope[Q_DIM], K_rope[KV_DIM], V[KV_DIM], xnorm[DIM])
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = concat(axis=cax,interleave=cid,values=(af,qrf,krf,vf,xn))[name=string(\"cat\")];\n", out_ch, SEQ];
+    // Output: concat(o_out[DIM], attn_out[Q_DIM], Q_rope[Q_DIM], K_rope[KV_DIM], V[KV_DIM])
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = concat(axis=cax,interleave=cid,values=(of,af,qrf,krf,vf))[name=string(\"cat\")];\n", out_ch, SEQ];
     [m appendString:@"    } -> (out);\n}\n"];
     return m;
-}
-
-// woFwd: attn_out[Q_DIM,SEQ] @ Wo → o_out[DIM,SEQ]
-// Simple dyn_matmul: IC=Q_DIM, OC=DIM
-static NSString *gen_wo_fwd_dynamic(void) {
-    return gen_dyn_matmul_mil(Q_DIM, DIM, SEQ);
 }
 
 // ===== Fused FFN forward: W1,W3 + SiLU + W2 + residual =====
@@ -292,62 +307,18 @@ static NSString *gen_ffn_fused_dynamic(void) {
 
 // ===== Backward kernels =====
 
-// ffnBwdW2t: dffn @ W2 → dsilu_raw (IC=DIM, OC=HIDDEN)
-static NSString *gen_ffn_bwd_w2t_dynamic(void) {
-    return gen_dyn_matmul_mil(DIM, HIDDEN, SEQ);
-}
-
-// ffnBwdW13t: dh1 @ W1 + dh3 @ W3 → dx_ffn (IC=HIDDEN, two matmuls added)
-static NSString *gen_ffn_bwd_w13t_dynamic(void) {
-    int sp_in = FFN_BWD_W13T_SP;
-    NSMutableString *m = [NSMutableString string];
-    [m appendString:MIL_HDR];
-    [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n", HIDDEN, sp_in];
-
-    [m appendFormat:@"        tensor<int32, [4]> sh = const()[name=string(\"sh\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", HIDDEN, SEQ];
-    [m appendString:@"        tensor<int32, [4]> b0 = const()[name=string(\"b0\"), val=tensor<int32, [4]>([0,0,0,0])];\n"];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dh1 = slice_by_size(x=x,begin=b0,size=sh)[name=string(\"dh1\")];\n", HIDDEN, SEQ];
-    [m appendFormat:@"        tensor<int32, [4]> b1 = const()[name=string(\"b1\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", SEQ];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dh3 = slice_by_size(x=x,begin=b1,size=sh)[name=string(\"dh3\")];\n", HIDDEN, SEQ];
-    [m appendFormat:@"        tensor<int32, [4]> b2 = const()[name=string(\"b2\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", 2*SEQ];
-    [m appendFormat:@"        tensor<int32, [4]> sw = const()[name=string(\"sw\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", HIDDEN, DIM];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> W1t = slice_by_size(x=x,begin=b2,size=sw)[name=string(\"W1t\")];\n", HIDDEN, DIM];
-    [m appendFormat:@"        tensor<int32, [4]> b3 = const()[name=string(\"b3\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", 2*SEQ+DIM];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> W3t = slice_by_size(x=x,begin=b3,size=sw)[name=string(\"W3t\")];\n", HIDDEN, DIM];
-
-    [m appendString:@"        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];\n"];
-    [m appendFormat:@"        tensor<int32, [4]> ra = const()[name=string(\"ra\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n", HIDDEN, SEQ];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dh12 = reshape(shape=ra,x=dh1)[name=string(\"dh12\")];\n", HIDDEN, SEQ];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dh1t = transpose(perm=pm,x=dh12)[name=string(\"dh1t\")];\n", SEQ, HIDDEN];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dh32 = reshape(shape=ra,x=dh3)[name=string(\"dh32\")];\n", HIDDEN, SEQ];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dh3t = transpose(perm=pm,x=dh32)[name=string(\"dh3t\")];\n", SEQ, HIDDEN];
-    [m appendFormat:@"        tensor<int32, [4]> rw = const()[name=string(\"rw\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n", HIDDEN, DIM];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> W1t2 = reshape(shape=rw,x=W1t)[name=string(\"W1t2\")];\n", HIDDEN, DIM];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> W3t2 = reshape(shape=rw,x=W3t)[name=string(\"W3t2\")];\n", HIDDEN, DIM];
-
-    [m appendString:@"        bool bF = const()[name=string(\"bF\"), val=bool(false)];\n"];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dx1m = matmul(transpose_x=bF,transpose_y=bF,x=dh1t,y=W1t2)[name=string(\"dx1m\")];\n", SEQ, DIM];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dx3m = matmul(transpose_x=bF,transpose_y=bF,x=dh3t,y=W3t2)[name=string(\"dx3m\")];\n", SEQ, DIM];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dxm = add(x=dx1m,y=dx3m)[name=string(\"dxm\")];\n", SEQ, DIM];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dxt = transpose(perm=pm,x=dxm)[name=string(\"dxt\")];\n", DIM, SEQ];
-    [m appendFormat:@"        tensor<int32, [4]> ro = const()[name=string(\"ro\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", DIM, SEQ];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dx = reshape(shape=ro,x=dxt)[name=string(\"dx\")];\n", DIM, SEQ];
-    [m appendString:@"    } -> (dx);\n}\n"];
-    return m;
-}
-
-// ===== Fused SiLU backward + W13t: dsilu_raw,h1,h3 → dh1,dh3 → dh1@W1+dh3@W3 → dx_ffn =====
-// Eliminates CPU SiLU backward entirely — runs on ANE.
-// Input: [1, HIDDEN, 1, 3*SEQ+2*DIM] fp16
-//   sp[0:SEQ]              = dsilu_raw [HIDDEN, SEQ]
-//   sp[SEQ:2*SEQ]          = h1 [HIDDEN, SEQ]  (saved forward activation)
-//   sp[2*SEQ:3*SEQ]        = h3 [HIDDEN, SEQ]  (saved forward activation)
-//   sp[3*SEQ:3*SEQ+DIM]    = W1 [HIDDEN, DIM]  (transposed weights)
-//   sp[3*SEQ+DIM:3*SEQ+2D] = W3 [HIDDEN, DIM]  (transposed weights)
+// ===== Fully fused FFN backward: W2^T matmul + SiLU backward + W1^T/W3^T matmul =====
+// Replaces separate ffnBwdW2t + ffnBwdFused. dsilu_raw never leaves ANE.
+// Input: [1, HIDDEN, 1, FFN_BWD_FULL_SP] fp16
+//   sp[0:SEQ]                    = dffn [DIM, SEQ] (only channels 0:DIM used, rest ignored)
+//   sp[SEQ:SEQ+DIM]              = W2^T [HIDDEN, DIM] (transposed weight, pre-staged)
+//   sp[SEQ+DIM:SEQ+DIM+SEQ]      = h1 [HIDDEN, SEQ] (saved forward activation)
+//   sp[SEQ+DIM+SEQ:SEQ+DIM+2S]   = h3 [HIDDEN, SEQ] (saved forward activation)
+//   sp[SEQ+DIM+2S:SEQ+2D+2S]     = W1 [HIDDEN, DIM] (weight, pre-staged)
+//   sp[SEQ+2D+2S:SEQ+3D+2S]      = W3 [HIDDEN, DIM] (weight, pre-staged)
 // Output: [1, DIM+2*HIDDEN, 1, SEQ] fp16 = concat(dx_ffn, dh1, dh3)
-// FFN_BWD_FUSED_SP defined in io.h
-static NSString *gen_ffn_bwd_fused_dynamic(void) {
-    int sp_in = FFN_BWD_FUSED_SP;
+static NSString *gen_ffn_bwd_full_dynamic(void) {
+    int sp_in = FFN_BWD_FULL_SP;
     int out_ch = DIM + 2*HIDDEN;
     NSMutableString *m = [NSMutableString string];
     [m appendString:MIL_HDR];
@@ -356,45 +327,63 @@ static NSString *gen_ffn_bwd_fused_dynamic(void) {
     // Common constants
     [m appendString:@"        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];\n"];
     [m appendString:@"        bool bF = const()[name=string(\"bF\"), val=bool(false)];\n"];
-    [m appendFormat:@"        tensor<int32, [4]> sh = const()[name=string(\"sh\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", HIDDEN, SEQ];
 
-    // Slice inputs: dsilu_raw, h1, h3
-    [m appendString:@"        tensor<int32, [4]> b0 = const()[name=string(\"b0\"), val=tensor<int32, [4]>([0,0,0,0])];\n"];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dsilu = slice_by_size(x=x,begin=b0,size=sh)[name=string(\"dsilu\")];\n", HIDDEN, SEQ];
-    [m appendFormat:@"        tensor<int32, [4]> b_h1 = const()[name=string(\"b_h1\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", SEQ];
+    // ===== Step 1: dffn @ W2^T → dsilu_raw =====
+    // Slice dffn [1, DIM, 1, SEQ] — only first DIM channels used
+    [m appendString:@"        tensor<int32, [4]> b_dffn = const()[name=string(\"b_dffn\"), val=tensor<int32, [4]>([0,0,0,0])];\n"];
+    [m appendFormat:@"        tensor<int32, [4]> s_dffn = const()[name=string(\"s_dffn\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dffn = slice_by_size(x=x,begin=b_dffn,size=s_dffn)[name=string(\"dffn\")];\n", DIM, SEQ];
+
+    // Slice W2^T [1, HIDDEN, 1, DIM]
+    [m appendFormat:@"        tensor<int32, [4]> b_w2 = const()[name=string(\"b_w2\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", SEQ];
+    [m appendFormat:@"        tensor<int32, [4]> s_w2 = const()[name=string(\"s_w2\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", HIDDEN, DIM];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> W2t = slice_by_size(x=x,begin=b_w2,size=s_w2)[name=string(\"W2t\")];\n", HIDDEN, DIM];
+
+    // Matmul: dffn[SEQ,DIM] @ W2[DIM,HIDDEN] → dsilu[SEQ,HIDDEN]
+    // dffn [1,DIM,1,SEQ] → [1,1,DIM,SEQ] → transpose → [1,1,SEQ,DIM]
+    [m appendFormat:@"        tensor<int32, [4]> r_dffn = const()[name=string(\"r_dffn\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dffn2 = reshape(shape=r_dffn,x=dffn)[name=string(\"dffn2\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dffnt = transpose(perm=pm,x=dffn2)[name=string(\"dffnt\")];\n", SEQ, DIM];
+
+    // W2^T [1,HIDDEN,1,DIM] → [1,1,HIDDEN,DIM] → transpose → [1,1,DIM,HIDDEN]
+    [m appendFormat:@"        tensor<int32, [4]> r_w2 = const()[name=string(\"r_w2\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n", HIDDEN, DIM];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> W2t2 = reshape(shape=r_w2,x=W2t)[name=string(\"W2t2\")];\n", HIDDEN, DIM];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> W2m = transpose(perm=pm,x=W2t2)[name=string(\"W2m\")];\n", DIM, HIDDEN];
+
+    // [1,1,SEQ,DIM] @ [1,1,DIM,HIDDEN] → [1,1,SEQ,HIDDEN]
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dsm = matmul(transpose_x=bF,transpose_y=bF,x=dffnt,y=W2m)[name=string(\"dsm\")];\n", SEQ, HIDDEN];
+
+    // Reshape to [1,HIDDEN,1,SEQ] for element-wise ops
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dsr = transpose(perm=pm,x=dsm)[name=string(\"dsr\")];\n", HIDDEN, SEQ];
+    [m appendFormat:@"        tensor<int32, [4]> r_ds = const()[name=string(\"r_ds\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", HIDDEN, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dsilu = reshape(shape=r_ds,x=dsr)[name=string(\"dsilu\")];\n", HIDDEN, SEQ];
+
+    // ===== Step 2: SiLU backward =====
+    [m appendFormat:@"        tensor<int32, [4]> sh = const()[name=string(\"sh\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", HIDDEN, SEQ];
+    [m appendFormat:@"        tensor<int32, [4]> b_h1 = const()[name=string(\"b_h1\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", SEQ+DIM];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> h1 = slice_by_size(x=x,begin=b_h1,size=sh)[name=string(\"h1\")];\n", HIDDEN, SEQ];
-    [m appendFormat:@"        tensor<int32, [4]> b_h3 = const()[name=string(\"b_h3\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", 2*SEQ];
+    [m appendFormat:@"        tensor<int32, [4]> b_h3 = const()[name=string(\"b_h3\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", SEQ+DIM+SEQ];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> h3 = slice_by_size(x=x,begin=b_h3,size=sh)[name=string(\"h3\")];\n", HIDDEN, SEQ];
 
-    // Slice weights: W1, W3
-    [m appendFormat:@"        tensor<int32, [4]> b_w1 = const()[name=string(\"b_w1\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", 3*SEQ];
-    [m appendFormat:@"        tensor<int32, [4]> sw = const()[name=string(\"sw\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", HIDDEN, DIM];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> W1t = slice_by_size(x=x,begin=b_w1,size=sw)[name=string(\"W1t\")];\n", HIDDEN, DIM];
-    [m appendFormat:@"        tensor<int32, [4]> b_w3 = const()[name=string(\"b_w3\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", 3*SEQ+DIM];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> W3t = slice_by_size(x=x,begin=b_w3,size=sw)[name=string(\"W3t\")];\n", HIDDEN, DIM];
-
-    // ===== SiLU backward on ANE =====
-    // sig = sigmoid(h1)
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> sig = sigmoid(x=h1)[name=string(\"sig\")];\n", HIDDEN, SEQ];
-
-    // silu_h1 = h1 * sig  (= silu(h1))
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> silu_h1 = mul(x=h1,y=sig)[name=string(\"silu_h1\")];\n", HIDDEN, SEQ];
-
-    // dh3 = dsilu_raw * silu(h1)  (gradient w.r.t. h3)
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dh3 = mul(x=dsilu,y=silu_h1)[name=string(\"dh3\")];\n", HIDDEN, SEQ];
 
-    // silu'(h1) = sig * (1 + h1 * (1 - sig))
     [m appendString:@"        fp16 one = const()[name=string(\"one\"), val=fp16(1.0)];\n"];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> oms = sub(x=one,y=sig)[name=string(\"oms\")];\n", HIDDEN, SEQ];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> h1_oms = mul(x=h1,y=oms)[name=string(\"h1_oms\")];\n", HIDDEN, SEQ];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> inner = add(x=one,y=h1_oms)[name=string(\"inner\")];\n", HIDDEN, SEQ];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> silu_d = mul(x=sig,y=inner)[name=string(\"silu_d\")];\n", HIDDEN, SEQ];
-
-    // dh1 = dsilu_raw * h3 * silu'(h1)  (gradient w.r.t. h1)
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dg = mul(x=dsilu,y=h3)[name=string(\"dg\")];\n", HIDDEN, SEQ];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dh1 = mul(x=dg,y=silu_d)[name=string(\"dh1\")];\n", HIDDEN, SEQ];
 
-    // ===== Matmul: dh1 @ W1 + dh3 @ W3 → dx_ffn =====
+    // ===== Step 3: dh1 @ W1 + dh3 @ W3 → dx_ffn =====
+    [m appendFormat:@"        tensor<int32, [4]> sw = const()[name=string(\"sw\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", HIDDEN, DIM];
+    [m appendFormat:@"        tensor<int32, [4]> b_w1 = const()[name=string(\"b_w1\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", SEQ+DIM+2*SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> W1t = slice_by_size(x=x,begin=b_w1,size=sw)[name=string(\"W1t\")];\n", HIDDEN, DIM];
+    [m appendFormat:@"        tensor<int32, [4]> b_w3 = const()[name=string(\"b_w3\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", SEQ+DIM+2*SEQ+DIM];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> W3t = slice_by_size(x=x,begin=b_w3,size=sw)[name=string(\"W3t\")];\n", HIDDEN, DIM];
+
     [m appendFormat:@"        tensor<int32, [4]> ra = const()[name=string(\"ra\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n", HIDDEN, SEQ];
     [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dh12 = reshape(shape=ra,x=dh1)[name=string(\"dh12\")];\n", HIDDEN, SEQ];
     [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dh1t = transpose(perm=pm,x=dh12)[name=string(\"dh1t\")];\n", SEQ, HIDDEN];
@@ -411,7 +400,7 @@ static NSString *gen_ffn_bwd_fused_dynamic(void) {
     [m appendFormat:@"        tensor<int32, [4]> ro = const()[name=string(\"ro\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", DIM, SEQ];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dx = reshape(shape=ro,x=dxt)[name=string(\"dx\")];\n", DIM, SEQ];
 
-    // Output: concat(dx_ffn, dh1, dh3) — need dh1,dh3 for async dW computation
+    // Output: concat(dx_ffn, dh1, dh3)
     [m appendString:@"        int32 cax = const()[name=string(\"cax\"), val=int32(1)];\n"];
     [m appendString:@"        bool cid = const()[name=string(\"cid\"), val=bool(false)];\n"];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = concat(axis=cax,interleave=cid,values=(dx,dh1,dh3))[name=string(\"cat\")];\n", out_ch, SEQ];
@@ -419,50 +408,166 @@ static NSString *gen_ffn_bwd_fused_dynamic(void) {
     return m;
 }
 
-// wotBwd: dy @ Wo → da (IC=DIM, OC=Q_DIM)
+// wotBwd: dy @ Wo → da (IC=DIM, OC=Q_DIM) — standalone, for fallback
 static NSString *gen_wot_dynamic(void) {
     return gen_dyn_matmul_mil(DIM, Q_DIM, SEQ);
 }
 
-// qBwd: dq @ Wq → dx_q (IC=Q_DIM, OC=DIM)
-static NSString *gen_q_bwd_dynamic(void) {
-    return gen_dyn_matmul_mil(Q_DIM, DIM, SEQ);
-}
-
-// kvBwd: dk @ Wk + dv @ Wv → dx_kv (IC=KV_DIM)
-// Input: [1, KV_DIM, 1, 2*SEQ+2*DIM] fp16
-// Same pattern as ffnBwdW13t but with KV_DIM channels
-static NSString *gen_kv_bwd_dynamic(void) {
-    int sp_in = KV_BWD_SP;
+// wotSdpaBwd1: FUSED wotBwd + sdpaBwd1
+// Stage 1: dx2_scaled @ Wo → da (wotBwd matmul)
+// Stage 2: recompute attention + dV, dp (sdpaBwd1, using da from stage 1)
+// Input: [1, Q_DIM, 1, 4*SEQ+Q_DIM] fp16
+//   sp[0:SEQ]                      = dx2_scaled [DIM, SEQ] (first DIM ch)
+//   sp[SEQ:SEQ+Q_DIM]              = Wo [DIM, Q_DIM] (first DIM ch, pre-staged)
+//   sp[SEQ+Q_DIM:2S+Q_DIM]         = Q [Q_DIM, SEQ]
+//   sp[2S+Q_DIM:3S+Q_DIM]          = K_tiled [Q_DIM, SEQ]
+//   sp[3S+Q_DIM:4S+Q_DIM]          = V_tiled [Q_DIM, SEQ]
+// Output: [1, Q_DIM+2*SCORE_CH, 1, SEQ] fp16 = (dV_full, probs, dp)
+static NSString *gen_wot_sdpa_bwd1_fused(void) {
+    float sc = 1.0f/sqrtf((float)HD);
+    int sp_in = WOT_SDPA_BWD1_SP;
     NSMutableString *m = [NSMutableString string];
     [m appendString:MIL_HDR];
-    [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n", KV_DIM, sp_in];
-
-    [m appendFormat:@"        tensor<int32, [4]> sh = const()[name=string(\"sh\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", KV_DIM, SEQ];
-    [m appendString:@"        tensor<int32, [4]> b0 = const()[name=string(\"b0\"), val=tensor<int32, [4]>([0,0,0,0])];\n"];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dk = slice_by_size(x=x,begin=b0,size=sh)[name=string(\"dk\")];\n", KV_DIM, SEQ];
-    [m appendFormat:@"        tensor<int32, [4]> b1 = const()[name=string(\"b1\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", SEQ];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dv = slice_by_size(x=x,begin=b1,size=sh)[name=string(\"dv\")];\n", KV_DIM, SEQ];
-    [m appendFormat:@"        tensor<int32, [4]> b2 = const()[name=string(\"b2\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", 2*SEQ];
-    [m appendFormat:@"        tensor<int32, [4]> sw = const()[name=string(\"sw\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", KV_DIM, DIM];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> Wkt = slice_by_size(x=x,begin=b2,size=sw)[name=string(\"Wkt\")];\n", KV_DIM, DIM];
-    [m appendFormat:@"        tensor<int32, [4]> b3 = const()[name=string(\"b3\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", 2*SEQ+DIM];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> Wvt = slice_by_size(x=x,begin=b3,size=sw)[name=string(\"Wvt\")];\n", KV_DIM, DIM];
+    [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n", Q_DIM, sp_in];
 
     [m appendString:@"        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];\n"];
-    [m appendFormat:@"        tensor<int32, [4]> ra = const()[name=string(\"ra\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n", KV_DIM, SEQ];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dk2 = reshape(shape=ra,x=dk)[name=string(\"dk2\")];\n", KV_DIM, SEQ];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dkt = transpose(perm=pm,x=dk2)[name=string(\"dkt\")];\n", SEQ, KV_DIM];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dv2 = reshape(shape=ra,x=dv)[name=string(\"dv2\")];\n", KV_DIM, SEQ];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dvt = transpose(perm=pm,x=dv2)[name=string(\"dvt\")];\n", SEQ, KV_DIM];
-    [m appendFormat:@"        tensor<int32, [4]> rw = const()[name=string(\"rw\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n", KV_DIM, DIM];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> Wkt2 = reshape(shape=rw,x=Wkt)[name=string(\"Wkt2\")];\n", KV_DIM, DIM];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> Wvt2 = reshape(shape=rw,x=Wvt)[name=string(\"Wvt2\")];\n", KV_DIM, DIM];
-
     [m appendString:@"        bool bF = const()[name=string(\"bF\"), val=bool(false)];\n"];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dxk = matmul(transpose_x=bF,transpose_y=bF,x=dkt,y=Wkt2)[name=string(\"dxk\")];\n", SEQ, DIM];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dxv = matmul(transpose_x=bF,transpose_y=bF,x=dvt,y=Wvt2)[name=string(\"dxv\")];\n", SEQ, DIM];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dxm = add(x=dxk,y=dxv)[name=string(\"dxm\")];\n", SEQ, DIM];
+    [m appendString:@"        bool bT = const()[name=string(\"bT\"), val=bool(true)];\n"];
+
+    // ===== STAGE 1: wotBwd matmul: dx2_scaled @ Wo → da =====
+    // dx2_scaled [DIM, SEQ] at sp[0:SEQ]
+    [m appendString:@"        tensor<int32, [4]> b_dx = const()[name=string(\"b_dx\"), val=tensor<int32, [4]>([0,0,0,0])];\n"];
+    [m appendFormat:@"        tensor<int32, [4]> s_dx = const()[name=string(\"s_dx\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dx = slice_by_size(x=x,begin=b_dx,size=s_dx)[name=string(\"dx\")];\n", DIM, SEQ];
+    // Wo [DIM, Q_DIM] at sp[SEQ:SEQ+Q_DIM]
+    [m appendFormat:@"        tensor<int32, [4]> b_wo = const()[name=string(\"b_wo\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", SEQ];
+    [m appendFormat:@"        tensor<int32, [4]> s_wo = const()[name=string(\"s_wo\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", DIM, Q_DIM];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> Wo = slice_by_size(x=x,begin=b_wo,size=s_wo)[name=string(\"Wo\")];\n", DIM, Q_DIM];
+    // Reshape+transpose for matmul
+    [m appendFormat:@"        tensor<int32, [4]> r_dx = const()[name=string(\"r_dx\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dx2 = reshape(shape=r_dx,x=dx)[name=string(\"dx2\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dxt = transpose(perm=pm,x=dx2)[name=string(\"dxt\")];\n", SEQ, DIM];
+    [m appendFormat:@"        tensor<int32, [4]> r_wo = const()[name=string(\"r_wo\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n", DIM, Q_DIM];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> Wo2 = reshape(shape=r_wo,x=Wo)[name=string(\"Wo2\")];\n", DIM, Q_DIM];
+    // matmul: [SEQ,DIM] @ [DIM,Q_DIM] → [SEQ,Q_DIM]
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> da_mm = matmul(transpose_x=bF,transpose_y=bF,x=dxt,y=Wo2)[name=string(\"da_mm\")];\n", SEQ, Q_DIM];
+    // Reshape da to [1,Q_DIM,1,SEQ] for SDPA backward
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> da_t = transpose(perm=pm,x=da_mm)[name=string(\"da_t\")];\n", Q_DIM, SEQ];
+    [m appendFormat:@"        tensor<int32, [4]> r_da = const()[name=string(\"r_da\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", Q_DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> da_flat = reshape(shape=r_da,x=da_t)[name=string(\"da_flat\")];\n", Q_DIM, SEQ];
+
+    // ===== STAGE 2: sdpaBwd1 using Q, K_tiled, V_tiled from input + da from stage 1 =====
+    // Q [Q_DIM, SEQ] at sp[SEQ+Q_DIM:2*SEQ+Q_DIM]
+    [m appendFormat:@"        tensor<int32, [4]> sz = const()[name=string(\"sz\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", Q_DIM, SEQ];
+    [m appendFormat:@"        tensor<int32, [4]> b_q = const()[name=string(\"b_q\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", SEQ+Q_DIM];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> qf = slice_by_size(x=x,begin=b_q,size=sz)[name=string(\"sq\")];\n", Q_DIM, SEQ];
+    // K_tiled [Q_DIM, SEQ] at sp[2*SEQ+Q_DIM:3*SEQ+Q_DIM]
+    [m appendFormat:@"        tensor<int32, [4]> b_k = const()[name=string(\"b_k\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", 2*SEQ+Q_DIM];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> kf = slice_by_size(x=x,begin=b_k,size=sz)[name=string(\"sk\")];\n", Q_DIM, SEQ];
+    // V_tiled [Q_DIM, SEQ] at sp[3*SEQ+Q_DIM:4*SEQ+Q_DIM]
+    [m appendFormat:@"        tensor<int32, [4]> b_v = const()[name=string(\"b_v\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", 3*SEQ+Q_DIM];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> vf = slice_by_size(x=x,begin=b_v,size=sz)[name=string(\"sv\")];\n", Q_DIM, SEQ];
+
+    // Reshape Q,K,V,da to heads [1,HEADS,HD,SEQ] → [1,HEADS,SEQ,HD]
+    [m appendFormat:@"        tensor<int32, [4]> rsh = const()[name=string(\"rsh\"), val=tensor<int32, [4]>([1,%d,%d,%d])];\n", HEADS, HD, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> qr = reshape(shape=rsh,x=qf)[name=string(\"rq\")];\n", HEADS, HD, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> q = transpose(perm=pm,x=qr)[name=string(\"tq\")];\n", HEADS, SEQ, HD];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> kr = reshape(shape=rsh,x=kf)[name=string(\"rk\")];\n", HEADS, HD, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> k = transpose(perm=pm,x=kr)[name=string(\"tk\")];\n", HEADS, SEQ, HD];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> vr = reshape(shape=rsh,x=vf)[name=string(\"rv\")];\n", HEADS, HD, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> v = transpose(perm=pm,x=vr)[name=string(\"tv\")];\n", HEADS, SEQ, HD];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> dr = reshape(shape=rsh,x=da_flat)[name=string(\"rd\")];\n", HEADS, HD, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> dat = transpose(perm=pm,x=dr)[name=string(\"td\")];\n", HEADS, SEQ, HD];
+
+    // Recompute attention scores: Q @ K^T * scale + mask → softmax → probs
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> sc1 = matmul(transpose_x=bF,transpose_y=bT,x=q,y=k)[name=string(\"mm1\")];\n", HEADS, SEQ, SEQ];
+    [m appendFormat:@"        fp16 scv = const()[name=string(\"scv\"), val=fp16(%f)];\n", sc];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> sc2 = mul(x=sc1,y=scv)[name=string(\"scl\")];\n", HEADS, SEQ, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> cm = const()[name=string(\"cm\"), val=tensor<fp16, [1,1,%d,%d]>(BLOBFILE(path=string(\"@model_path/weights/mask.bin\"), offset=uint64(64)))];\n", SEQ, SEQ, SEQ, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> ms = add(x=sc2,y=cm)[name=string(\"msk\")];\n", HEADS, SEQ, SEQ];
+    [m appendString:@"        int32 sax = const()[name=string(\"sax\"), val=int32(-1)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> probs = softmax(axis=sax,x=ms)[name=string(\"sm\")];\n", HEADS, SEQ, SEQ];
+
+    // dV = probs^T @ da, dp = da @ V^T
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> dv4 = matmul(transpose_x=bT,transpose_y=bF,x=probs,y=dat)[name=string(\"dv\")];\n", HEADS, SEQ, HD];
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> dp4 = matmul(transpose_x=bF,transpose_y=bT,x=dat,y=v)[name=string(\"dp\")];\n", HEADS, SEQ, SEQ];
+
+    // Reshape dV to [Q_DIM, SEQ]
+    [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> dvt = transpose(perm=pm,x=dv4)[name=string(\"dvt\")];\n", HEADS, HD, SEQ];
+    [m appendFormat:@"        tensor<int32, [4]> dvs = const()[name=string(\"dvs\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", Q_DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dvf = reshape(shape=dvs,x=dvt)[name=string(\"dvf\")];\n", Q_DIM, SEQ];
+
+    // Flatten probs and dp to [SCORE_CH, SEQ]
+    [m appendFormat:@"        tensor<int32, [4]> scs = const()[name=string(\"scs\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", SCORE_CH, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> pf = reshape(shape=scs,x=probs)[name=string(\"pf\")];\n", SCORE_CH, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dpf = reshape(shape=scs,x=dp4)[name=string(\"dpf\")];\n", SCORE_CH, SEQ];
+
+    // Output: concat(dV_full, probs, dp) — same as standalone sdpaBwd1
+    [m appendString:@"        int32 cax = const()[name=string(\"cax\"), val=int32(1)];\n"];
+    [m appendString:@"        bool cid = const()[name=string(\"cid\"), val=bool(false)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = concat(axis=cax,interleave=cid,values=(dvf,pf,dpf))[name=string(\"cat\")];\n", Q_DIM+2*SCORE_CH, SEQ];
+    [m appendString:@"    } -> (out);\n}\n"];
+    return m;
+}
+
+// qkvBwd: fused dq@Wq + dk@Wk + dv@Wv → dx_attn (all summed, single output)
+// Input: [1, Q_DIM, 1, QKV_BWD_SP] fp16
+// Output: [1, DIM, 1, SEQ] fp16
+static NSString *gen_qkv_bwd_dynamic(void) {
+    int sp_in = QKV_BWD_SP;
+    NSMutableString *m = [NSMutableString string];
+    [m appendString:MIL_HDR];
+    [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n", Q_DIM, sp_in];
+
+    [m appendString:@"        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];\n"];
+    [m appendString:@"        bool bF = const()[name=string(\"bF\"), val=bool(false)];\n"];
+
+    // ===== dq @ Wq → dx_q =====
+    // Slice dq [Q_DIM, SEQ]
+    [m appendString:@"        tensor<int32, [4]> b_dq = const()[name=string(\"b_dq\"), val=tensor<int32, [4]>([0,0,0,0])];\n"];
+    [m appendFormat:@"        tensor<int32, [4]> s_q = const()[name=string(\"s_q\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", Q_DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dq = slice_by_size(x=x,begin=b_dq,size=s_q)[name=string(\"dq\")];\n", Q_DIM, SEQ];
+    // Slice Wq [Q_DIM, DIM]
+    [m appendFormat:@"        tensor<int32, [4]> b_wq = const()[name=string(\"b_wq\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", SEQ];
+    [m appendFormat:@"        tensor<int32, [4]> s_wq = const()[name=string(\"s_wq\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", Q_DIM, DIM];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> Wq = slice_by_size(x=x,begin=b_wq,size=s_wq)[name=string(\"Wq\")];\n", Q_DIM, DIM];
+    // Reshape+transpose for matmul: [SEQ,Q_DIM] @ [Q_DIM,DIM] → [SEQ,DIM]
+    [m appendFormat:@"        tensor<int32, [4]> rq = const()[name=string(\"rq\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n", Q_DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dq2 = reshape(shape=rq,x=dq)[name=string(\"dq2\")];\n", Q_DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dqt = transpose(perm=pm,x=dq2)[name=string(\"dqt\")];\n", SEQ, Q_DIM];
+    [m appendFormat:@"        tensor<int32, [4]> rwq = const()[name=string(\"rwq\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n", Q_DIM, DIM];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> Wq2 = reshape(shape=rwq,x=Wq)[name=string(\"Wq2\")];\n", Q_DIM, DIM];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dxq = matmul(transpose_x=bF,transpose_y=bF,x=dqt,y=Wq2)[name=string(\"dxq\")];\n", SEQ, DIM];
+
+    // ===== dk @ Wk → dx_k =====
+    // Slice dk [KV_DIM, SEQ] — only first KV_DIM channels
+    [m appendFormat:@"        tensor<int32, [4]> b_dk = const()[name=string(\"b_dk\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", SEQ+DIM];
+    [m appendFormat:@"        tensor<int32, [4]> s_kv = const()[name=string(\"s_kv\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", KV_DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dk = slice_by_size(x=x,begin=b_dk,size=s_kv)[name=string(\"dk\")];\n", KV_DIM, SEQ];
+    // Slice Wk [KV_DIM, DIM]
+    [m appendFormat:@"        tensor<int32, [4]> b_wk = const()[name=string(\"b_wk\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", SEQ+DIM+2*SEQ];
+    [m appendFormat:@"        tensor<int32, [4]> s_wkv = const()[name=string(\"s_wkv\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", KV_DIM, DIM];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> Wk = slice_by_size(x=x,begin=b_wk,size=s_wkv)[name=string(\"Wk\")];\n", KV_DIM, DIM];
+    [m appendFormat:@"        tensor<int32, [4]> rkv = const()[name=string(\"rkv\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n", KV_DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dk2 = reshape(shape=rkv,x=dk)[name=string(\"dk2\")];\n", KV_DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dkt = transpose(perm=pm,x=dk2)[name=string(\"dkt\")];\n", SEQ, KV_DIM];
+    [m appendFormat:@"        tensor<int32, [4]> rwkv = const()[name=string(\"rwkv\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n", KV_DIM, DIM];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> Wk2 = reshape(shape=rwkv,x=Wk)[name=string(\"Wk2\")];\n", KV_DIM, DIM];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dxk = matmul(transpose_x=bF,transpose_y=bF,x=dkt,y=Wk2)[name=string(\"dxk\")];\n", SEQ, DIM];
+
+    // ===== dv @ Wv → dx_v =====
+    [m appendFormat:@"        tensor<int32, [4]> b_dv = const()[name=string(\"b_dv\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", SEQ+DIM+SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dv = slice_by_size(x=x,begin=b_dv,size=s_kv)[name=string(\"dv\")];\n", KV_DIM, SEQ];
+    [m appendFormat:@"        tensor<int32, [4]> b_wv = const()[name=string(\"b_wv\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", SEQ+2*DIM+2*SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> Wv = slice_by_size(x=x,begin=b_wv,size=s_wkv)[name=string(\"Wv\")];\n", KV_DIM, DIM];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dv2 = reshape(shape=rkv,x=dv)[name=string(\"dv2\")];\n", KV_DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dvt = transpose(perm=pm,x=dv2)[name=string(\"dvt\")];\n", SEQ, KV_DIM];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> Wv2 = reshape(shape=rwkv,x=Wv)[name=string(\"Wv2\")];\n", KV_DIM, DIM];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dxv = matmul(transpose_x=bF,transpose_y=bF,x=dvt,y=Wv2)[name=string(\"dxv\")];\n", SEQ, DIM];
+
+    // ===== Sum all three: dx_q + dx_k + dx_v =====
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dxqk = add(x=dxq,y=dxk)[name=string(\"dxqk\")];\n", SEQ, DIM];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dxm = add(x=dxqk,y=dxv)[name=string(\"dxm\")];\n", SEQ, DIM];
     [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> dxt = transpose(perm=pm,x=dxm)[name=string(\"dxt\")];\n", DIM, SEQ];
     [m appendFormat:@"        tensor<int32, [4]> ro = const()[name=string(\"ro\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", DIM, SEQ];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dx = reshape(shape=ro,x=dxt)[name=string(\"dx\")];\n", DIM, SEQ];
@@ -472,25 +577,27 @@ static NSString *gen_kv_bwd_dynamic(void) {
 
 // SDPA backward part 1: recompute attention + dV, dp
 // Uses tiled K,V at HEADS dimension (CPU pre-tiles)
-// Input: [1, 2*Q_DIM+2*Q_DIM, 1, SEQ] fp16 = (Q, K_tiled, V_tiled, da)
-// Output: [1, Q_DIM+2*SCORE_CH, 1, SEQ] fp16 = (dV_full, probs, dp)
+// Input: [1, 4*Q_DIM, 1, SEQ] fp16 = (da, Q, K_tiled, V_tiled)
+// da first enables IOSurface sharing with wotBwd output (wotBwd writes ch[0:Q_DIM])
+// Output: [1, 2*SCORE_CH+Q_DIM, 1, SEQ] fp16 = (probs, dp, dV_full)
 static NSString *gen_sdpa_bwd1_noweight(void) {
     float sc = 1.0f/sqrtf((float)HD);
-    int in_ch = 4*Q_DIM;  // Q + K_tiled + V_tiled + da, all at Q_DIM (HEADS*HD)
+    int in_ch = 4*Q_DIM;
     NSMutableString *m = [NSMutableString string];
     [m appendString:MIL_HDR];
     [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n", in_ch, SEQ];
 
-    // Slice Q,K_tiled,V_tiled,da — all [Q_DIM, SEQ]
+    // Slice da,Q,K_tiled,V_tiled — all [Q_DIM, SEQ]
+    // Layout: (da, Q, K, V) — da at ch[0] for wotBwd output sharing
     [m appendFormat:@"        tensor<int32, [4]> sz = const()[name=string(\"sz\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", Q_DIM, SEQ];
     [m appendString:@"        tensor<int32, [4]> b0 = const()[name=string(\"b0\"), val=tensor<int32, [4]>([0,0,0,0])];\n"];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> qf = slice_by_size(x=x,begin=b0,size=sz)[name=string(\"s0\")];\n", Q_DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> da = slice_by_size(x=x,begin=b0,size=sz)[name=string(\"s0\")];\n", Q_DIM, SEQ];
     [m appendFormat:@"        tensor<int32, [4]> b1 = const()[name=string(\"b1\"), val=tensor<int32, [4]>([0,%d,0,0])];\n", Q_DIM];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> kf = slice_by_size(x=x,begin=b1,size=sz)[name=string(\"s1\")];\n", Q_DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> qf = slice_by_size(x=x,begin=b1,size=sz)[name=string(\"s1\")];\n", Q_DIM, SEQ];
     [m appendFormat:@"        tensor<int32, [4]> b2 = const()[name=string(\"b2\"), val=tensor<int32, [4]>([0,%d,0,0])];\n", 2*Q_DIM];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> vf = slice_by_size(x=x,begin=b2,size=sz)[name=string(\"s2\")];\n", Q_DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> kf = slice_by_size(x=x,begin=b2,size=sz)[name=string(\"s2\")];\n", Q_DIM, SEQ];
     [m appendFormat:@"        tensor<int32, [4]> b3 = const()[name=string(\"b3\"), val=tensor<int32, [4]>([0,%d,0,0])];\n", 3*Q_DIM];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> da = slice_by_size(x=x,begin=b3,size=sz)[name=string(\"s3\")];\n", Q_DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> vf = slice_by_size(x=x,begin=b3,size=sz)[name=string(\"s3\")];\n", Q_DIM, SEQ];
 
     // Reshape to heads [1,HEADS,HD,SEQ] → [1,HEADS,SEQ,HD]
     [m appendFormat:@"        tensor<int32, [4]> rsh = const()[name=string(\"rsh\"), val=tensor<int32, [4]>([1,%d,%d,%d])];\n", HEADS, HD, SEQ];
@@ -531,7 +638,9 @@ static NSString *gen_sdpa_bwd1_noweight(void) {
 
     [m appendString:@"        int32 cax = const()[name=string(\"cax\"), val=int32(1)];\n"];
     [m appendString:@"        bool cid = const()[name=string(\"cid\"), val=bool(false)];\n"];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = concat(axis=cax,interleave=cid,values=(dvf,pf,dpf))[name=string(\"cat\")];\n", Q_DIM+2*SCORE_CH, SEQ];
+    // Output reordered to (probs, dp, dV) — enables IOSurface sharing with sdpaBwd2 input
+    // sdpaBwd2 expects (probs, dp, Q, K) — probs+dp land in place, only Q needs re-staging
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = concat(axis=cax,interleave=cid,values=(pf,dpf,dvf))[name=string(\"cat\")];\n", Q_DIM+2*SCORE_CH, SEQ];
     [m appendString:@"    } -> (out);\n}\n"];
     return m;
 }
@@ -596,6 +705,11 @@ static NSString *gen_sdpa_bwd2(void) {
     [m appendString:@"    } -> (out);\n}\n"];
     return m;
 }
+
+// NOTE: sdpaBwd1+2 fusion attempted but ANE compiler rejects it with
+// "Graph has a cycle path" — the compiler can't handle the DAG topology where
+// q,k,probs each fan out to multiple matmuls. This is an ANE compiler limitation.
+// The separate bwd1/bwd2 kernels work fine.
 
 // Causal mask blob
 static NSData *g_mask_blob = nil;

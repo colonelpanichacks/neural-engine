@@ -51,11 +51,12 @@ typedef struct {
 // Per-layer activations (saved for backward)
 // fp16 fields: stored as fp16 to avoid fp16→fp32→fp16 roundtrips between ANE kernels
 typedef struct {
-    float *layer_in, *xnorm, *attn_out, *o_out;
+    float *layer_in, *xnorm;
+    _Float16 *attn_out_fp16;  // stored as fp16, converted to fp32 only at dWo capture time
     float *x2, *x2norm, *ffn_out;
     _Float16 *Q_fp16, *K_fp16, *V_fp16;     // saved from sdpaFwd, used in sdpaBwd1/2
-    _Float16 *h1_fp16, *h3_fp16;             // saved from ffnFused, used in ffnBwdFused
     _Float16 *silu_out_fp16;                 // saved from ffnFused, used for dW2 gradient
+    // h1/h3 are pre-staged directly into ffnBwdFull input IOSurface during forward
 } LayerActs;
 
 // Per-layer gradients
@@ -64,18 +65,18 @@ typedef struct {
 } LayerGrads;
 
 // ANE kernel handle
-typedef struct { void *model; IOSurfaceRef ioIn, ioOut; void *request; void *tmpDir; } Kern;
+typedef struct { void *model; void *aneModel; IOSurfaceRef ioIn, ioOut; void *request; void *tmpDir; } Kern;
 
 // Per-layer IOSurfaces for pre-staged weights
 typedef struct {
-    IOSurfaceRef sdpaFwd_in, woFwd_in, ffnFused_in;
-    IOSurfaceRef ffnBwdW2t_in, ffnBwdW13t_in, ffnBwdFused_in, wotBwd_in, qBwd_in, kvBwd_in;
+    IOSurfaceRef sdpaFwd_in, ffnFused_in;
+    IOSurfaceRef ffnBwdFull_in, wotBwd_in, wotSdpaBwd1_in, qkvBwd_in;
 } PerLayerSurfaces;
 
 // Per-layer ANE requests (bound to per-layer IOSurfaces)
 typedef struct {
-    void *sdpaFwd, *woFwd, *ffnFused;
-    void *ffnBwdW2t, *ffnBwdW13t, *ffnBwdFused, *wotBwd, *qBwd, *kvBwd;
+    void *sdpaFwd, *ffnFused;
+    void *ffnBwdFull, *wotBwd, *wotSdpaBwd1, *qkvBwd;
 } PerLayerRequests;
 
 // Checkpoint header
@@ -93,6 +94,7 @@ typedef struct {
 static Class g_D, g_I, g_AR, g_AIO;
 static mach_timebase_info_data_t g_tb;
 static int g_compile_count = 0;
+static id g_ane_client = nil;  // _ANEClient for evaluateRealTime
 
 static void ane_init(void) {
     dlopen("/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine", RTLD_NOW);
@@ -100,6 +102,8 @@ static void ane_init(void) {
     g_I  = NSClassFromString(@"_ANEInMemoryModel");
     g_AR = NSClassFromString(@"_ANERequest");
     g_AIO= NSClassFromString(@"_ANEIOSurfaceObject");
+    Class ANEClient = NSClassFromString(@"_ANEClient");
+    if (ANEClient) g_ane_client = ((id(*)(Class,SEL))objc_msgSend)(ANEClient, @selector(sharedConnection));
 }
 static double tb_ms(uint64_t t) { return (double)t * g_tb.numer / g_tb.denom / 1e6; }
 
@@ -135,25 +139,22 @@ static LayerActs layer_acts_alloc(void) {
     LayerActs a;
     a.layer_in=(float*)malloc(SEQ*DIM*4);
     a.xnorm=(float*)malloc(SEQ*DIM*4);
-    a.attn_out=(float*)malloc(SEQ*Q_DIM*4); a.o_out=(float*)malloc(SEQ*DIM*4);
+    a.attn_out_fp16=(_Float16*)malloc(SEQ*Q_DIM*2);
     a.x2=(float*)malloc(SEQ*DIM*4); a.x2norm=(float*)malloc(SEQ*DIM*4);
     a.ffn_out=(float*)malloc(SEQ*DIM*4);
     // fp16 activations — no fp32 roundtrip needed
     a.Q_fp16=(_Float16*)malloc(SEQ*Q_DIM*2);
     a.K_fp16=(_Float16*)malloc(SEQ*KV_DIM*2);
     a.V_fp16=(_Float16*)malloc(SEQ*KV_DIM*2);
-    a.h1_fp16=(_Float16*)malloc(SEQ*HIDDEN*2);
-    a.h3_fp16=(_Float16*)malloc(SEQ*HIDDEN*2);
     a.silu_out_fp16=(_Float16*)malloc(SEQ*HIDDEN*2);
     return a;
 }
 static void layer_acts_free(LayerActs *a) {
     free(a->layer_in);free(a->xnorm);
-    free(a->attn_out);free(a->o_out);free(a->x2);free(a->x2norm);
+    free(a->attn_out_fp16);free(a->x2);free(a->x2norm);
     free(a->ffn_out);
     free(a->Q_fp16);free(a->K_fp16);free(a->V_fp16);
     free(a->silu_out_fp16);
-    free(a->h1_fp16);free(a->h3_fp16);
 }
 static LayerGrads layer_grads_alloc(void) {
     LayerGrads g;
