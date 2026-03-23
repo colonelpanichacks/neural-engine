@@ -241,26 +241,33 @@ static void adam_update(float *w, const float *g, AdamState *s, int t, float lr,
 // Parallelized across tokens with dispatch_apply.
 static float cross_entropy_loss(float *dlogits, const float *logits, const uint16_t *targets, int V, int S, float grad_scale) {
     float *losses = (float*)alloca(S * 4);
-    float invS = grad_scale / S;  // folds loss_scale into gradient normalization
+    float invS = grad_scale / S;
 
-    dispatch_apply((size_t)S, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t t) {
-        const float *row_in = logits + t * V;
-        float *row_out = dlogits + t * V;
-        // Copy to output buffer only if not aliased (in-place mode skips this)
-        if (row_out != row_in) memcpy(row_out, row_in, V * 4);
-        // Softmax
-        float maxv; vDSP_maxv(row_out, 1, &maxv, (vDSP_Length)V);
-        float neg_max = -maxv;
-        vDSP_vsadd(row_out, 1, &neg_max, row_out, 1, (vDSP_Length)V);
-        int n = V; vvexpf(row_out, row_out, &n);
-        float sum; vDSP_sve(row_out, 1, &sum, (vDSP_Length)V);
-        float inv_sum = 1.0f / sum;
-        vDSP_vsmul(row_out, 1, &inv_sum, row_out, 1, (vDSP_Length)V);
-        // Loss + gradient
-        int tgt = targets[t];
-        losses[t] = -logf(row_out[tgt] + 1e-10f);
-        row_out[tgt] -= 1.0f;
-        vDSP_vsmul(row_out, 1, &invS, row_out, 1, (vDSP_Length)V);
+    // Batch 16 tokens per dispatch block to reduce dispatch_apply overhead
+    // (256 blocks × ~7us each = 1.8ms overhead → 16 blocks × ~7us = 0.1ms)
+    const int CE_BLOCK = 16;
+    int nblocks = (S + CE_BLOCK - 1) / CE_BLOCK;
+    dispatch_apply((size_t)nblocks, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t b) {
+        int t_start = (int)b * CE_BLOCK;
+        int t_end = t_start + CE_BLOCK;
+        if (t_end > S) t_end = S;
+        for (int t = t_start; t < t_end; t++) {
+            const float *row_in = logits + t * V;
+            float *row_out = dlogits + t * V;
+            if (row_out != row_in) memcpy(row_out, row_in, V * 4);
+            // Softmax
+            float maxv; vDSP_maxv(row_out, 1, &maxv, (vDSP_Length)V);
+            float neg_max = -maxv;
+            vDSP_vsadd(row_out, 1, &neg_max, row_out, 1, (vDSP_Length)V);
+            int n = V; vvexpf(row_out, row_out, &n);
+            float sum; vDSP_sve(row_out, 1, &sum, (vDSP_Length)V);
+            // Fuse normalize + gradient scale into one pass
+            float scale = invS / sum;
+            float softmax_tgt = row_out[targets[t]] / sum;
+            losses[t] = -logf(softmax_tgt + 1e-10f);
+            vDSP_vsmul(row_out, 1, &scale, row_out, 1, (vDSP_Length)V);
+            row_out[targets[t]] -= invS;
+        }
     });
 
     float total_loss;
