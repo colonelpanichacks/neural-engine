@@ -491,10 +491,33 @@ static void gqa_reduce_kv_f16(_Float16 *out, const _Float16 *in, int seq) {
     }
 }
 
-// Parallel fp16 strided scatter with non-temporal stores: multi-threaded STNP
-// bypasses read-for-ownership cache miss on write-only IOSurface data
+// Serial STNP scatter: non-temporal stores bypass read-for-ownership cache miss.
+// Microbenchmark showed serial STNP is 1.45x faster than dispatch_apply+memcpy
+// for 512-byte/channel copies with 7680-byte stride. dispatch_apply overhead +
+// cache bouncing between cores is counterproductive for small per-channel copies.
 static void scatter_f16_par(_Float16 *dst, const _Float16 *src,
                             int channels, int seq, int stride, int sp_offset) {
+    int bytes = seq * 2;
+    for (int ch = 0; ch < channels; ch++) {
+        const uint8_t *s = (const uint8_t*)(src + ch * seq);
+        uint8_t *d = (uint8_t*)(dst + ch * stride + sp_offset);
+        int i = 0;
+        for (; i + 31 < bytes; i += 32) {
+            __asm__ volatile (
+                "ldp q0, q1, [%0]   \n"
+                "stnp q0, q1, [%1]  \n"
+                : : "r"(s + i), "r"(d + i)
+                : "v0", "v1", "memory"
+            );
+        }
+        for (; i < bytes; i++) d[i] = s[i];
+    }
+}
+
+// Parallel fp16 strided scatter with write-prefetch hints instead of STNP:
+// prefetch next channel's destination before memcpy write to warm the cache line
+static void scatter_f16_par_pf(_Float16 *dst, const _Float16 *src,
+                               int channels, int seq, int stride, int sp_offset) {
     if (!g_scatter_q) g_scatter_q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
     const int BLOCK = 64;
     int nblocks = (channels + BLOCK - 1) / BLOCK;
@@ -506,16 +529,11 @@ static void scatter_f16_par(_Float16 *dst, const _Float16 *src,
         for (int ch = ch_start; ch < ch_end; ch++) {
             const uint8_t *s = (const uint8_t*)(src + ch * seq);
             uint8_t *d = (uint8_t*)(dst + ch * stride + sp_offset);
-            int i = 0;
-            for (; i + 31 < bytes; i += 32) {
-                __asm__ volatile (
-                    "ldp q0, q1, [%0]   \n"
-                    "stnp q0, q1, [%1]  \n"
-                    : : "r"(s + i), "r"(d + i)
-                    : "v0", "v1", "memory"
-                );
+            // Prefetch next channel's destination for write
+            if (ch + 1 < channels) {
+                __builtin_prefetch(dst + (ch + 1) * stride + sp_offset, 1, 0);
             }
-            for (; i < bytes; i++) d[i] = s[i];
+            memcpy(d, s, bytes);
         }
     });
 }

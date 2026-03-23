@@ -74,42 +74,34 @@ static void cvt_scatter_f32_f16(_Float16 *dst, const float *src,
     }
 }
 
-// Parallel version for large scatters (>512 channels). Uses dispatch_apply to spread
-// across P-cores. Block size tuned to amortize dispatch overhead vs cache thrashing.
-static dispatch_queue_t g_scatter_q = NULL;
+// Serial STNP convert+scatter: fp32→fp16 conversion with non-temporal strided write.
+// Microbenchmark showed serial is faster than dispatch_apply for small per-channel copies.
+static dispatch_queue_t g_scatter_q = NULL;  // kept for dV prestage (overlap window)
 static void cvt_scatter_f32_f16_par(_Float16 *dst, const float *src,
                                      int channels, int seq, int stride, int sp_offset) {
-    if (!g_scatter_q) g_scatter_q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
-    const int BLOCK = 64;  // channels per work unit
-    int nblocks = (channels + BLOCK - 1) / BLOCK;
-    dispatch_apply((size_t)nblocks, g_scatter_q, ^(size_t b) {
-        int ch_start = (int)b * BLOCK;
-        int ch_end = ch_start + BLOCK;
-        if (ch_end > channels) ch_end = channels;
-        for (int ch = ch_start; ch < ch_end; ch++) {
-            _Float16 *d = dst + ch * stride + sp_offset;
-            const float *s = src + ch * seq;
-            int i = 0;
-            // STNP: convert 16 fp32 → 16 fp16 (32 bytes), non-temporal store pair
-            for (; i + 15 < seq; i += 16) {
-                float16x8_t h0 = vcombine_f16(vcvt_f16_f32(vld1q_f32(s + i)),
-                                               vcvt_f16_f32(vld1q_f32(s + i + 4)));
-                float16x8_t h1 = vcombine_f16(vcvt_f16_f32(vld1q_f32(s + i + 8)),
-                                               vcvt_f16_f32(vld1q_f32(s + i + 12)));
-                __asm__ volatile (
-                    "stnp q0, q1, [%0]"
-                    : : "r"(d + i), "w"(h0), "w"(h1)
-                    : "memory"
-                );
-            }
-            for (; i + 7 < seq; i += 8) {
-                float16x8_t h = vcombine_f16(vcvt_f16_f32(vld1q_f32(s + i)),
+    for (int ch = 0; ch < channels; ch++) {
+        _Float16 *d = dst + ch * stride + sp_offset;
+        const float *s = src + ch * seq;
+        int i = 0;
+        // STNP: convert 16 fp32 → 16 fp16 (32 bytes), non-temporal store pair
+        for (; i + 15 < seq; i += 16) {
+            float16x8_t h0 = vcombine_f16(vcvt_f16_f32(vld1q_f32(s + i)),
+                                           vcvt_f16_f32(vld1q_f32(s + i + 4)));
+            float16x8_t h1 = vcombine_f16(vcvt_f16_f32(vld1q_f32(s + i + 8)),
+                                           vcvt_f16_f32(vld1q_f32(s + i + 12)));
+            __asm__ volatile (
+                "stnp q0, q1, [%0]"
+                : : "r"(d + i), "w"(h0), "w"(h1)
+                : "memory"
+            );
+        }
+        for (; i + 7 < seq; i += 8) {
+            float16x8_t h = vcombine_f16(vcvt_f16_f32(vld1q_f32(s + i)),
                                               vcvt_f16_f32(vld1q_f32(s + i + 4)));
                 vst1q_f16((__fp16*)(d + i), h);
             }
             for (; i < seq; i++) d[i] = (_Float16)s[i];
-        }
-    });
+    }
 }
 
 // IOSurface I/O (channel-first [C,S] layout, fp16 on surface)
