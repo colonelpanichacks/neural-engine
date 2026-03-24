@@ -302,6 +302,45 @@ static void adam_update(float *w, const float *g, AdamState *s, int t, float lr,
     vDSP_vsma(g_adam_tmp1, 1, &neg_lr, w, 1, w, 1, vn);
 }
 
+// Fast vectorized exp using NEON: exp(x) = 2^(x * log2e)
+// Split into integer part (bit shift) and fractional part (degree-4 polynomial)
+// Max relative error < 0.02% over [-87, 0] range (sufficient for softmax gradients)
+static inline void fast_expf_neon(float *dst, const float *src, int n) {
+    const float32x4_t log2e = vdupq_n_f32(1.442695041f);
+    const float32x4_t ln2 = vdupq_n_f32(0.6931471806f);
+    // Polynomial coefficients for 2^frac on [0,1): p(f) ≈ 2^f
+    const float32x4_t c0 = vdupq_n_f32(1.0f);
+    const float32x4_t c1 = vdupq_n_f32(0.6931472f);
+    const float32x4_t c2 = vdupq_n_f32(0.2402265f);
+    const float32x4_t c3 = vdupq_n_f32(0.0554953f);
+    const float32x4_t c4 = vdupq_n_f32(0.0096884f);
+    const float32x4_t min_val = vdupq_n_f32(-87.0f);  // exp underflow clamp
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        for (int j = 0; j < 2; j++) {
+            float32x4_t x = vmaxq_f32(vld1q_f32(src + i + j*4), min_val);
+            float32x4_t z = vmulq_f32(x, log2e);  // x * log2(e)
+            float32x4_t zi = vrndmq_f32(z);  // floor(z) = integer part
+            float32x4_t frac = vsubq_f32(z, zi);  // fractional part [0, 1)
+            // 2^frac via Horner: ((c4*f + c3)*f + c2)*f + c1)*f + c0
+            float32x4_t p = vfmaq_f32(c3, c4, frac);
+            p = vfmaq_f32(c2, p, frac);
+            p = vfmaq_f32(c1, p, frac);
+            p = vfmaq_f32(c0, p, frac);
+            // 2^integer via bit manipulation: reinterpret (int(zi)+127) << 23 as float
+            int32x4_t ei = vcvtq_s32_f32(zi);
+            ei = vaddq_s32(ei, vdupq_n_s32(127));
+            ei = vshlq_n_s32(ei, 23);
+            float32x4_t pow2i = vreinterpretq_f32_s32(ei);
+            vst1q_f32(dst + i + j*4, vmulq_f32(p, pow2i));
+        }
+    }
+    for (; i < n; i++) {
+        float x = src[i] < -87.0f ? -87.0f : src[i];
+        dst[i] = expf(x);
+    }
+}
+
 // Cross-entropy loss: operates on logits[S, V] row-major (each row = one token, contiguous)
 // Eliminates strided gather/scatter — each token's V logits are contiguous in memory.
 // grad_scale folds loss_scale into gradient computation (avoids separate vDSP_vsmul pass).

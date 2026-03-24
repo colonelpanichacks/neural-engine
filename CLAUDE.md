@@ -160,21 +160,24 @@ Then `make MODEL=mymodel`.
 
 ## Performance (M4 Pro, Qwen3-0.6B)
 
-| Metric | SEQ=256 | SEQ=512 |
-|--------|---------|---------|
-| Step time (50-step avg) | ~210ms | ~412ms |
-| Best step | 199.9ms | ~400ms |
-| ANE forward | ~68ms | ~139ms |
-| ANE backward | ~107ms | ~193ms |
-| IO staging (fwd) | ~4ms | ~9ms |
-| IO staging (bwd) | ~14ms | ~17ms |
-| RMSNorm (fwd+bwd) | ~10ms | ~24ms |
-| Cross-entropy | ~4ms | ~8ms |
-| RoPE backward | ~1ms | ~2ms |
-| FLOPs/step | 676B | 1,353B |
-| Tokens/step | 256 | 512 |
-| Tokens/sec | ~1,220 | ~1,243 |
-| Compute utilization | ~17.4% | ~17.9% |
+| Metric | SEQ=256 |
+|--------|---------|
+| Step time (200-step avg) | ~202ms |
+| Best step | 196.2ms |
+| ANE forward | ~68ms |
+| ANE backward | ~103ms |
+| IO staging (fwd) | ~3.5ms |
+| IO staging (bwd) | ~5.8ms |
+| RMSNorm (fwd+bwd) | ~7.5ms |
+| Cross-entropy | ~4.5ms |
+| dW overlap copies | ~2.5ms |
+| Residual + RoPE | ~2.6ms |
+| Gap (embed + overhead) | ~2.2ms |
+| FLOPs/step | 676B |
+| Tokens/step | 256 |
+| Tokens/sec | ~1,306 |
+| Compute utilization | ~18.1% |
+| CPU overhead vs ANE floor | 14% |
 
 ### ANE Hardware Notes
 
@@ -237,6 +240,11 @@ Then `make MODEL=mymodel`.
 23. **fp16 attn_out storage**: Store attention output as fp16 (was fp32). Eliminates fp16→fp32 conversion in deferred forward copy (4MB→2MB per layer). fp32 conversion deferred to dWo capture in overlap window. Reduces deferred copy pressure at SEQ=512.
 24. **Parallel Adam weight restaging**: `dispatch_apply` across layers for weight restaging in Adam step (cvt_scatter weight updates parallelized across 28 layers). Adam step: 983→525ms (-47%).
 25. **Fused fp16 residual + direct layer_in write**: Eliminated separate `cvt_f16_f32` + `vDSP_vsma` for attention residual — single NEON pass reads fp16 o_out, converts, scales, and adds in-place. Also writes ffnFused output directly to next layer's `layer_in` buffer (eliminates extra memcpy). io_fwd: 5.0→3.8ms (-24%). ~210ms/step.
+26. **Non-temporal stores (STNP) for IOSurface scatter**: ARM64 STNP bypasses read-for-ownership cache miss on write-only IOSurface data. Applied to `cvt_scatter_f32_f16_par`, `cvt_scatter_f32_f16`, and `scatter_f16_par`. io_fwd: 5.5→4.2ms (-24%), ffn_w: 1.2→1.0ms (-17%). ~208ms/step.
+27. **Serial STNP scatter — remove dispatch_apply**: Microbenchmark (`bench_scatter.m`) proved serial STNP is 1.45x faster than `dispatch_apply`+memcpy for 512-byte/channel strided writes. dispatch_apply overhead + cache bouncing between cores was counterproductive. qkv_w: 6.5→0.9ms (-86%), io_bwd: 13→5.7ms (-56%). ~200ms/step.
+28. **Batched CE dispatch + fused softmax scale**: Batch 16 tokens per `dispatch_apply` block (was 1). Fuse softmax normalization + gradient scaling into single `vDSP_vsmul`. cls: 4.3ms (stable).
+29. **Fused RMSNorm backward + residual add**: Created `rmsnorm_bwd_add()` that fuses the residual connection add into the RMSNorm backward gradient loop. Eliminates 56 separate `vDSP_vadd` passes over DIM*SEQ elements per step (56MB saved). rms_bwd: 6.5→4.7ms (-28%).
+30. **Double-buffered forward output**: Ping-pong two output IOSurfaces for sdpaFwd and ffnFused. Layer L writes to buffer[L&1], deferred copies read from same buffer while layer L+1 writes to buffer[(L+1)&1]. Eliminates 228 `dispatch_semaphore` ops per step. Replaced with single `dispatch_barrier_sync`. gap: 2.5→2.2ms. **Step: ~199ms avg, 196ms best.**
 
 ### ANE Compiler/Hardware Limitations Discovered
 
@@ -258,6 +266,14 @@ Then `make MODEL=mymodel`.
 - **Two-phase dispatch (`buffersReady`+`enqueueSets`) is a no-op**: Both `doBuffersReadyWithModel` and `doEnqueueSetsWithModel` return success (ret=0) with `_ANEOutputSetEnqueue` objects, but ANE does not execute the kernel. The two-phase path requires prior `prepareChainingWithModel` success which is firmware-blocked.
 - **`_ANEProgramForEvaluation.processRequest` is identical to `doEvaluateDirectWithModel`**: Same speed (0.155ms), same underlying IOKit call. No dispatch shortcut exists at any framework level.
 - **Dispatch overhead floor**: ~0.155ms for small kernels, ~0.28ms for training-sized kernels. 196 evals/step × 0.28ms = ~55ms dispatch overhead (26% of step time). This is the dominant bottleneck but unreducible from userspace.
+
+- **`dispatch_apply` is counterproductive for small strided writes**: Microbenchmark proved serial STNP is 1.45x faster than `dispatch_apply`+memcpy for 512-byte/channel copies with 7680-byte stride. Cache bouncing between cores exceeds the parallelism benefit. Write-prefetch and DC ZVA are both slower than plain memcpy for this pattern.
+- **STNP (non-temporal store pair) is optimal for IOSurface writes**: IOSurface data is write-only from CPU perspective (ANE reads via DMA). STNP bypasses read-for-ownership cache miss, hitting 58.6 GB/s vs 40.3 GB/s for regular memcpy (1.45x faster).
+- **Per-request output IOSurface binding works**: ANE respects `_ANERequest` output surface bindings — tested with sentinel patterns confirming the alternate surface receives output while the original is untouched. Enables double-buffered output for concurrent deferred copies.
+- **Backward layer pipelining is impossible**: The residual stream creates an irreducible serial chain: `qkvBwd[L] → dx_attn → RMSNorm1_bwd → dy → dffn → ffnBwdFull[L-1]`. Every link is a true data dependency. No two backward kernels across layers are independent.
+- **SME2 cannot accelerate RMSNorm**: M4 Pro has SME2 (`FEAT_SME2=1`) but RMSNorm is a reduction (dot product), not a matmul. Even the SME2 kernel library uses streaming SVE (not ZA tiles/FMOPA) for RMSNorm. `smstart`/`smstop` transition cost (~1μs) across 56 calls/step negates streaming SVE benefit.
+- **`sharedPrivilegedConnection` is a dead end**: Returns `_ANEDeviceController` with `isPrivileged=1` but NULL device pointer and zero programHandle. Cannot dispatch from userspace — daemon-side stub only.
+- **Apple's `vvexpf` is already polynomial-optimized**: Custom NEON polynomial exp (degree-4 Horner) gives identical performance to vecLib's `vvexpf` on M4 Pro. No speedup from replacing it.
 
 ### IOKit / Hardware Registry (M4 Pro)
 
