@@ -302,7 +302,13 @@ int main(int argc, char *argv[]) {
         printf("Compiled %d kernels in %.0fms (shared across all %d layers)\n", g_compile_count, compile_ms, NLAYERS);
 
         // Allocate per-layer IOSurfaces + requests
-        printf("Allocating per-layer IOSurfaces...\n");
+        // Double-buffered forward output: ping-pong eliminates 228 semaphore ops/step (~1.1ms)
+        printf("Allocating per-layer IOSurfaces (double-buffered forward)...\n");
+        int sdpa_out_ch = DIM + 2*Q_DIM + 2*KV_DIM;
+        int ffn_out_ch = DIM + 3*HIDDEN;
+        IOSurfaceRef sdpa_out_buf[2] = { make_surface(sdpa_out_ch*SEQ*2), make_surface(sdpa_out_ch*SEQ*2) };
+        IOSurfaceRef ffn_out_buf[2]  = { make_surface(ffn_out_ch*SEQ*2),  make_surface(ffn_out_ch*SEQ*2) };
+
         PerLayerSurfaces pls[NLAYERS];
         PerLayerRequests plr[NLAYERS];
         for (int L = 0; L < NLAYERS; L++) {
@@ -313,8 +319,9 @@ int main(int argc, char *argv[]) {
             pls[L].wotSdpaBwd1_in = dk.wotSdpaBwd1 ? make_surface(Q_DIM*WOT_SDPA_BWD1_SP*2) : NULL;
             pls[L].qkvBwd_in     = make_surface(Q_DIM*QKV_BWD_SP*2);
 
-            plr[L].sdpaFwd   = make_request(dk.sdpaFwd,   pls[L].sdpaFwd_in);
-            plr[L].ffnFused  = make_request(dk.ffnFused,  pls[L].ffnFused_in);
+            int b = L & 1;
+            plr[L].sdpaFwd   = make_request_io(dk.sdpaFwd, pls[L].sdpaFwd_in, sdpa_out_buf[b]);
+            plr[L].ffnFused  = make_request_io(dk.ffnFused, pls[L].ffnFused_in, ffn_out_buf[b]);
             plr[L].ffnBwdFull = make_request(dk.ffnBwdFull, pls[L].ffnBwdFull_in);
             plr[L].wotBwd    = make_request(dk.wotBwd,    pls[L].wotBwd_in);
             plr[L].wotSdpaBwd1 = dk.wotSdpaBwd1 ? make_request(dk.wotSdpaBwd1, pls[L].wotSdpaBwd1_in) : NULL;
@@ -371,8 +378,8 @@ int main(int argc, char *argv[]) {
         dispatch_group_t dw_grp = dispatch_group_create();
         // Concurrent queue for deferred forward IO copies (backward-only data)
         dispatch_queue_t fwd_io_q = dispatch_queue_create("fwd_io", DISPATCH_QUEUE_CONCURRENT);
-        dispatch_semaphore_t sdpa_copy_done = dispatch_semaphore_create(1);
-        dispatch_semaphore_t ffn_copy_done = dispatch_semaphore_create(1);
+        // No semaphores needed — double-buffered output surfaces prevent data races
+        // Deferred copies read from buffer[L&1] while next eval writes to buffer[(L+1)&1]
 
         float last_loss = 999.0f;
         float best_loss = resume_loss > 0 ? resume_loss : 999.0f;
@@ -419,34 +426,30 @@ int main(int argc, char *argv[]) {
                 dispatch_group_wait(dw_grp, DISPATCH_TIME_FOREVER);
                 t_cblas_wait += tb_ms(mach_absolute_time() - t0);
 
-                // SDPA+Wo forward (fused ANE): xnorm + Wq,Wk,Wv,Wo → o_out, attn_out, Q, K, V
+                // SDPA+Wo forward — double-buffered: writes to sdpa_out_buf[L&1]
+                int sb = L & 1;
                 t0 = mach_absolute_time();
                 write_sdpa_fwd_acts(pls[L].sdpaFwd_in, xnorm_buf);
-                dispatch_semaphore_wait(sdpa_copy_done, DISPATCH_TIME_FOREVER);
-                dispatch_semaphore_signal(sdpa_copy_done);
                 t_io_fwd += tb_ms(mach_absolute_time() - t0);
                 t0 = mach_absolute_time();
                 ane_eval_req(dk.sdpaFwd, plr[L].sdpaFwd);
                 t_ane_fwd += tb_ms(mach_absolute_time() - t0);
 
-                // Fused residual: read o_out as fp16, convert+scale+add in single NEON pass
-                // Eliminates separate cvt_f16_f32 + vDSP_vsma (saves one full DIM*SEQ memory pass)
+                // Fused residual from this layer's output buffer
                 t0 = mach_absolute_time();
-                _Float16 *fwd_out = (_Float16*)IOSurfaceGetBaseAddress(dk.sdpaFwd->ioOut);
+                _Float16 *fwd_out = (_Float16*)IOSurfaceGetBaseAddress(sdpa_out_buf[sb]);
                 residual_cvt_f16(ac->x2, fwd_out, x_cur, res_alpha, SEQ*DIM);
                 t_io_fwd += tb_ms(mach_absolute_time() - t0);
 
-                // Deferred: attn_out, Q, K, V only needed in backward (4MB overlapped)
-                dispatch_semaphore_wait(sdpa_copy_done, DISPATCH_TIME_FOREVER);
-                _Float16 *sdpa_src = fwd_out;  // captured by block
+                // Deferred copies — no semaphore needed (double-buffered, no contention)
+                _Float16 *sdpa_src = fwd_out;
                 _Float16 *dst_attn = ac->attn_out_fp16;
                 _Float16 *dst_Q = ac->Q_fp16, *dst_K = ac->K_fp16, *dst_V = ac->V_fp16;
                 dispatch_async(fwd_io_q, ^{
-                    memcpy(dst_attn, sdpa_src + DIM*SEQ, Q_DIM*SEQ*2);  // fp16 direct, no conversion
+                    memcpy(dst_attn, sdpa_src + DIM*SEQ, Q_DIM*SEQ*2);
                     memcpy(dst_Q, sdpa_src + (DIM+Q_DIM)*SEQ, Q_DIM*SEQ*2);
                     memcpy(dst_K, sdpa_src + (DIM+2*Q_DIM)*SEQ, KV_DIM*SEQ*2);
                     memcpy(dst_V, sdpa_src + (DIM+2*Q_DIM+KV_DIM)*SEQ, KV_DIM*SEQ*2);
-                    dispatch_semaphore_signal(sdpa_copy_done);
                 });
 
                 // CPU: RMSNorm for FFN
@@ -454,45 +457,38 @@ int main(int argc, char *argv[]) {
                 rmsnorm(ac->x2norm, ac->x2, lw[L].rms_ffn, DIM, SEQ);
                 t_rms += tb_ms(mach_absolute_time() - t0);
 
-                // FFN staging: x2norm + x2 → IOSurface
+                // FFN — double-buffered: writes to ffn_out_buf[L&1]
+                int fb = L & 1;
                 t0 = mach_absolute_time();
                 write_ffn_fused_acts(pls[L].ffnFused_in, ac->x2norm, ac->x2);
-                dispatch_semaphore_wait(ffn_copy_done, DISPATCH_TIME_FOREVER);
-                dispatch_semaphore_signal(ffn_copy_done);
                 t_io_fwd += tb_ms(mach_absolute_time() - t0);
                 t0 = mach_absolute_time();
                 ane_eval_req(dk.ffnFused, plr[L].ffnFused);
                 t_ane_fwd += tb_ms(mach_absolute_time() - t0);
 
-                // Read ffnFused output: write directly to next layer's layer_in (or x_cur for last layer)
-                _Float16 *ffn_out = (_Float16*)IOSurfaceGetBaseAddress(dk.ffnFused->ioOut);
+                // Read from this layer's output buffer
+                _Float16 *ffn_out = (_Float16*)IOSurfaceGetBaseAddress(ffn_out_buf[fb]);
                 t0 = mach_absolute_time();
                 if (L < NLAYERS - 1) {
-                    // Write directly to next layer's backward save buffer (eliminates memcpy at L+1 start)
                     cvt_f16_f32(acts[L+1].layer_in, ffn_out, DIM*SEQ);
-                    x_cur = acts[L+1].layer_in;  // redirect x_cur pointer
+                    x_cur = acts[L+1].layer_in;
                 } else {
-                    cvt_f16_f32(x_cur, ffn_out, DIM*SEQ);  // last layer → classifier
+                    cvt_f16_f32(x_cur, ffn_out, DIM*SEQ);
                 }
                 t_io_fwd += tb_ms(mach_absolute_time() - t0);
 
-                // Deferred: h1/h3 pre-staged into ffnBwdFull input, silu_out to contiguous buffer
-                dispatch_semaphore_wait(ffn_copy_done, DISPATCH_TIME_FOREVER);
+                // Deferred copies — no semaphore (double-buffered)
                 _Float16 *ffn_src = ffn_out;
                 IOSurfaceRef bwd_in_L = pls[L].ffnBwdFull_in;
                 _Float16 *dst_silu = ac->silu_out_fp16;
                 dispatch_async(fwd_io_q, ^{
                     prestage_ffn_bwd_h1h3(bwd_in_L, ffn_src);
                     memcpy(dst_silu, ffn_src + (DIM+2*HIDDEN)*SEQ,   HIDDEN*SEQ*2);
-                    dispatch_semaphore_signal(ffn_copy_done);
                 });
             }
 
             // Wait for all deferred forward copies before backward pass
-            dispatch_semaphore_wait(sdpa_copy_done, DISPATCH_TIME_FOREVER);
-            dispatch_semaphore_signal(sdpa_copy_done);
-            dispatch_semaphore_wait(ffn_copy_done, DISPATCH_TIME_FOREVER);
-            dispatch_semaphore_signal(ffn_copy_done);
+            dispatch_barrier_sync(fwd_io_q, ^{});
 
             // Final RMSNorm + classifier + loss (CPU cblas — needs FP32 precision for softmax)
             t0 = mach_absolute_time();

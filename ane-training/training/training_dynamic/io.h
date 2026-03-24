@@ -250,6 +250,15 @@ static void *make_request(Kern *k, IOSurfaceRef ioIn) {
         @[wI], @[@0], @[wO], @[@0], nil, nil, @0);
     return (void*)CFBridgingRetain(req);
 }
+// Make request with explicit output IOSurface (for double-buffered output)
+static void *make_request_io(Kern *k, IOSurfaceRef ioIn, IOSurfaceRef ioOut) {
+    id wI = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), ioIn);
+    id wO = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), ioOut);
+    id req = ((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(g_AR,
+        @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
+        @[wI], @[@0], @[wO], @[@0], nil, nil, @0);
+    return (void*)CFBridgingRetain(req);
+}
 
 // ===== Per-layer weight staging for GQA =====
 // sdpaFwd: [1, DIM, 1, SEQ + Q_DIM + KV_DIM + KV_DIM] fp16 — no Wo (separate kernel)
