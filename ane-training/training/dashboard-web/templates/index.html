@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ANE Training Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Press+Start+2P&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+:root {
+    --bg-dark: #0a0a0f;
+    --bg-medium: #0f1018;
+    --bg-light: #161822;
+    --bg-hover: #1c1f2e;
+    --text-primary: #e2e4ec;
+    --text-secondary: #8b8fa3;
+    --text-muted: #4a4e63;
+    --border: #1e2235;
+    --border-highlight: #2a3050;
+    --accent: #00d4ff;
+    --accent-dim: rgba(0, 212, 255, 0.15);
+    --accent-hover: #00b8e0;
+    --danger: #ff2d55;
+    --danger-dim: rgba(255, 45, 85, 0.12);
+    --success: #00ff88;
+    --success-dim: rgba(0, 255, 136, 0.12);
+    --warning: #ffd600;
+    --purple: #bd00ff;
+}
+body {
+    display: flex; height: 100vh; background: var(--bg-dark);
+    color: var(--text-primary);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    overflow: hidden;
+}
+body::after {
+    content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 9999;
+    background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.03) 2px, rgba(0,0,0,0.03) 4px);
+}
+
+/* ═══ Sidebar ═══ */
+#sidebar {
+    width: 280px; min-width: 280px; background: var(--bg-medium);
+    border-right: 1px solid var(--border); display: flex; flex-direction: column;
+    overflow-y: auto;
+}
+.sidebar-header {
+    padding: 20px 16px 16px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 10px;
+}
+.sidebar-header h1 {
+    font-family: 'Press Start 2P', monospace; font-size: 10px; letter-spacing: 2px;
+    background: linear-gradient(135deg, var(--purple), var(--accent));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+}
+.sidebar-header .dot {
+    width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+    transition: background 0.3s;
+}
+.dot-connected { background: var(--success); box-shadow: 0 0 6px var(--success); }
+.dot-disconnected { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
+.dot-compiling { background: var(--warning); box-shadow: 0 0 6px var(--warning); animation: pulse 1s infinite; }
+.dot-running { background: var(--success); box-shadow: 0 0 6px var(--success); animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+.section { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+.section-title {
+    font-family: 'Fira Code', monospace; font-size: 9px; font-weight: 500;
+    color: var(--text-muted); letter-spacing: 1.5px; text-transform: uppercase;
+    margin-bottom: 10px;
+}
+
+/* Model info */
+.info-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+.info-label { font-family: 'Fira Code', monospace; font-size: 10px; color: var(--text-muted); }
+.info-value { font-family: 'Fira Code', monospace; font-size: 11px; color: var(--text-secondary); }
+.info-value.accent { color: var(--accent); }
+
+/* Controls */
+.control-group { margin-bottom: 8px; }
+.control-group label {
+    display: block; font-family: 'Fira Code', monospace; font-size: 9px;
+    color: var(--text-muted); letter-spacing: 0.5px; margin-bottom: 4px;
+}
+.control-group input, .control-group select {
+    width: 100%; padding: 6px 8px; background: var(--bg-dark); border: 1px solid var(--border);
+    border-radius: 4px; color: var(--text-primary); font-family: 'Fira Code', monospace; font-size: 11px;
+    outline: none; transition: border-color 0.2s;
+}
+.control-group input:focus, .control-group select:focus { border-color: var(--accent); }
+.control-group select { appearance: none; cursor: pointer; }
+.control-group select option { background: var(--bg-dark); }
+
+.radio-group { display: flex; gap: 8px; }
+.radio-group label {
+    display: flex; align-items: center; gap: 4px; cursor: pointer;
+    font-size: 11px; color: var(--text-secondary);
+}
+.radio-group input[type="radio"] { accent-color: var(--accent); }
+
+.btn {
+    width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 6px;
+    font-family: 'Fira Code', monospace; font-size: 11px; font-weight: 500;
+    letter-spacing: 1px; text-transform: uppercase; cursor: pointer;
+    transition: all 0.2s; display: flex; align-items: center; justify-content: center; gap: 8px;
+}
+.btn-start {
+    background: var(--accent-dim); color: var(--accent); border-color: rgba(0,212,255,0.3);
+}
+.btn-start:hover { background: rgba(0,212,255,0.25); border-color: var(--accent); }
+.btn-stop {
+    background: var(--danger-dim); color: var(--danger); border-color: rgba(255,45,85,0.3);
+}
+.btn-stop:hover { background: rgba(255,45,85,0.25); border-color: var(--danger); }
+.btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+/* ═══ Main Area ═══ */
+#main {
+    flex: 1; display: flex; flex-direction: column; overflow: hidden;
+}
+.charts-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+    padding: 12px; flex: 1; overflow-y: auto;
+}
+.chart-panel {
+    background: var(--bg-medium); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px; display: flex; flex-direction: column;
+}
+.chart-title {
+    font-family: 'Fira Code', monospace; font-size: 9px; font-weight: 500;
+    color: var(--text-muted); letter-spacing: 1px; text-transform: uppercase;
+    margin-bottom: 8px; display: flex; align-items: center; gap: 6px;
+}
+.chart-title svg { width: 14px; height: 14px; stroke: var(--text-muted); fill: none; stroke-width: 2; }
+.chart-container { flex: 1; position: relative; min-height: 140px; }
+
+/* Gauges row */
+.gauges-row { display: flex; gap: 16px; justify-content: center; align-items: center; flex-wrap: wrap; padding: 8px 0; }
+.gauge { text-align: center; }
+.gauge-value {
+    font-family: 'Press Start 2P', monospace; font-size: 18px; color: var(--accent);
+    text-shadow: 0 0 20px rgba(0,212,255,0.4);
+}
+.gauge-value.success { color: var(--success); text-shadow: 0 0 20px rgba(0,255,136,0.4); }
+.gauge-value.purple { color: var(--purple); text-shadow: 0 0 20px rgba(189,0,255,0.4); }
+.gauge-label {
+    font-family: 'Fira Code', monospace; font-size: 8px; color: var(--text-muted);
+    letter-spacing: 1px; margin-top: 4px;
+}
+
+/* ANE bar */
+.ane-bar-container { width: 100%; height: 24px; background: var(--bg-dark); border-radius: 4px; overflow: hidden; position: relative; margin-top: 8px; }
+.ane-bar-fill { height: 100%; transition: width 0.3s; border-radius: 4px; }
+.ane-bar-label {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    font-family: 'Fira Code', monospace; font-size: 9px; color: var(--text-primary);
+}
+
+/* ═══ Log Panel ═══ */
+.log-panel {
+    background: var(--bg-dark); border-top: 1px solid var(--border);
+    font-family: 'Fira Code', 'SF Mono', monospace; font-size: 11px;
+    color: var(--text-secondary); overflow-y: auto; height: 200px;
+    padding: 8px 12px; line-height: 1.6;
+}
+.log-panel .log-step { color: var(--accent); }
+.log-panel .log-error { color: var(--danger); }
+.log-panel .log-adam { color: var(--warning); }
+.log-panel .log-ckpt { color: var(--success); }
+.log-panel .log-timing { color: var(--text-muted); }
+.log-panel .log-grad { color: var(--purple); }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--border-highlight); }
+
+@media (max-width: 900px) {
+    #sidebar { display: none; }
+    .charts-grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<!-- ═══ Sidebar ═══ -->
+<div id="sidebar">
+    <div class="sidebar-header">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2">
+            <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
+        </svg>
+        <h1>ANE TRAINER</h1>
+        <div class="dot dot-disconnected" id="status-dot" title="Disconnected"></div>
+    </div>
+
+    <!-- Model Info -->
+    <div class="section">
+        <div class="section-title">Model</div>
+        <div class="info-row"><span class="info-label">Name</span><span class="info-value" id="info-model">--</span></div>
+        <div class="info-row"><span class="info-label">Params</span><span class="info-value" id="info-params">--</span></div>
+        <div class="info-row"><span class="info-label">Kernels</span><span class="info-value" id="info-kernels">--</span></div>
+        <div class="info-row"><span class="info-label">FLOPs/step</span><span class="info-value" id="info-flops">--</span></div>
+    </div>
+
+    <!-- Controls -->
+    <div class="section">
+        <div class="section-title">Training Controls</div>
+        <div class="control-group">
+            <label>Model</label>
+            <select id="ctrl-model">
+                <option value="qwen3_06b">Qwen3-0.6B (SEQ=256)</option>
+                <option value="qwen3_06b_seq512">Qwen3-0.6B (SEQ=512)</option>
+                <option value="stories110m">Stories 110M</option>
+            </select>
+        </div>
+        <div class="control-group">
+            <label>Mode</label>
+            <div class="radio-group">
+                <label><input type="radio" name="mode" value="resume" checked> Resume</label>
+                <label><input type="radio" name="mode" value="scratch"> Scratch</label>
+            </div>
+        </div>
+        <div class="control-group"><label>Steps</label><input type="number" id="ctrl-steps" placeholder="10000"></div>
+        <div class="control-group"><label>Learning Rate</label><input type="text" id="ctrl-lr" placeholder="5e-4"></div>
+        <div class="control-group"><label>Accum Steps</label><input type="number" id="ctrl-accum" placeholder="10"></div>
+        <div class="control-group"><label>Warmup</label><input type="number" id="ctrl-warmup" placeholder="1000"></div>
+        <div class="control-group"><label>Grad Clip</label><input type="text" id="ctrl-clip" placeholder="1.0"></div>
+        <div style="margin-top: 12px;">
+            <button class="btn btn-start" id="btn-start" onclick="startTraining()">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="5,3 19,12 5,21"/></svg>
+                Start Training
+            </button>
+            <button class="btn btn-stop" id="btn-stop" onclick="stopTraining()" style="display:none; margin-top: 8px;">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
+                Stop Training
+            </button>
+        </div>
+    </div>
+
+    <!-- Status -->
+    <div class="section" style="flex:1;">
+        <div class="section-title">Live Status</div>
+        <div class="info-row"><span class="info-label">Step</span><span class="info-value accent" id="info-step">--</span></div>
+        <div class="info-row"><span class="info-label">Loss</span><span class="info-value accent" id="info-loss">--</span></div>
+        <div class="info-row"><span class="info-label">Best Loss</span><span class="info-value" id="info-best" style="color:var(--success)">--</span></div>
+        <div class="info-row"><span class="info-label">LR</span><span class="info-value" id="info-lr">--</span></div>
+        <div class="info-row"><span class="info-label">Adam</span><span class="info-value" id="info-adam">--</span></div>
+    </div>
+</div>
+
+<!-- ═══ Main Area ═══ -->
+<div id="main">
+    <div class="charts-grid">
+        <!-- Loss Chart -->
+        <div class="chart-panel">
+            <div class="chart-title">
+                <svg viewBox="0 0 24 24"><polyline points="22,12 18,12 15,21 9,3 6,12 2,12"/></svg>
+                Loss Curve
+            </div>
+            <div class="chart-container"><canvas id="loss-chart"></canvas></div>
+        </div>
+
+        <!-- Timing Breakdown -->
+        <div class="chart-panel">
+            <div class="chart-title">
+                <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12,6 12,12 16,14"/></svg>
+                Step Timing (ms)
+            </div>
+            <div class="chart-container"><canvas id="timing-chart"></canvas></div>
+        </div>
+
+        <!-- Gradient Norms -->
+        <div class="chart-panel">
+            <div class="chart-title">
+                <svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+                Gradient Norms
+            </div>
+            <div class="chart-container"><canvas id="grad-chart"></canvas></div>
+        </div>
+
+        <!-- ANE Utilization + Gauges -->
+        <div class="chart-panel">
+            <div class="chart-title">
+                <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+                ANE Performance
+            </div>
+            <div class="gauges-row">
+                <div class="gauge"><div class="gauge-value" id="gauge-toksec">--</div><div class="gauge-label">TOKENS/SEC</div></div>
+                <div class="gauge"><div class="gauge-value success" id="gauge-msstep">--</div><div class="gauge-label">MS/STEP</div></div>
+                <div class="gauge"><div class="gauge-value purple" id="gauge-anepct">--</div><div class="gauge-label">ANE %</div></div>
+            </div>
+            <div class="ane-bar-container">
+                <div class="ane-bar-fill" id="ane-bar" style="width:0%; background: linear-gradient(90deg, var(--accent), var(--success));"></div>
+                <div class="ane-bar-label" id="ane-bar-label">ANE Compute vs Overhead</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Log Terminal -->
+    <div class="log-panel" id="log-panel"></div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+// WebSocket
+// ═══════════════════════════════════════════════════════════════
+
+const socket = io();
+let connected = false;
+let reconnectDelay = 2000;
+const SEQ_MAP = { qwen3_06b: 256, qwen3_06b_seq512: 512, stories110m: 256 };
+
+socket.on('connect', () => {
+    connected = true;
+    reconnectDelay = 2000;
+    updateConnectionDot();
+});
+socket.on('disconnect', () => {
+    connected = false;
+    updateConnectionDot();
+});
+
+function updateConnectionDot() {
+    const dot = document.getElementById('status-dot');
+    dot.className = connected ? 'dot dot-connected' : 'dot dot-disconnected';
+    dot.title = connected ? 'Connected' : 'Disconnected';
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Charts Setup
+// ═══════════════════════════════════════════════════════════════
+
+const chartDefaults = {
+    animation: false, responsive: true, maintainAspectRatio: false,
+    plugins: { legend: { display: false } },
+    scales: {
+        x: { grid: { color: '#1e2235' }, ticks: { color: '#4a4e63', font: { size: 9, family: 'Fira Code' }, maxTicksLimit: 8 } },
+        y: { grid: { color: '#1e2235' }, ticks: { color: '#4a4e63', font: { size: 9, family: 'Fira Code' } } }
+    }
+};
+
+// Loss chart
+const lossChart = new Chart(document.getElementById('loss-chart'), {
+    type: 'line',
+    data: { labels: [], datasets: [{ data: [], borderColor: '#00d4ff', borderWidth: 1.5, pointRadius: 0, tension: 0.1 }] },
+    options: { ...chartDefaults }
+});
+
+// Timing stacked bar
+const timingComponents = [
+    { key: 'ane_fwd', label: 'ANE Fwd', color: '#00d4ff' },
+    { key: 'ane_bwd', label: 'ANE Bwd', color: '#00ff88' },
+    { key: 'io_fwd', label: 'IO Fwd', color: '#5b7fff' },
+    { key: 'io_bwd', label: 'IO Bwd', color: '#00b8a9' },
+    { key: 'rms', label: 'RMS Fwd', color: '#bd00ff' },
+    { key: 'rms_bwd', label: 'RMS Bwd', color: '#ff6b9d' },
+    { key: 'cls', label: 'CE Loss', color: '#ffd600' },
+    { key: 'dw', label: 'dW Copy', color: '#ff8c00' },
+    { key: 'resid', label: 'Residual', color: '#ff4081' },
+    { key: 'rope', label: 'RoPE', color: '#7c4dff' },
+    { key: 'gap', label: 'Gap', color: '#4a4e63' },
+];
+const timingChart = new Chart(document.getElementById('timing-chart'), {
+    type: 'bar',
+    data: {
+        labels: [],
+        datasets: timingComponents.map(c => ({
+            label: c.label, data: [], backgroundColor: c.color, borderWidth: 0
+        }))
+    },
+    options: {
+        ...chartDefaults, indexAxis: 'x',
+        scales: {
+            ...chartDefaults.scales,
+            x: { ...chartDefaults.scales.x, stacked: true },
+            y: { ...chartDefaults.scales.y, stacked: true }
+        },
+        plugins: {
+            legend: { display: true, position: 'bottom',
+                labels: { color: '#4a4e63', font: { size: 8, family: 'Fira Code' }, boxWidth: 8, padding: 6 } }
+        }
+    }
+});
+
+// Gradient norms
+const gradChart = new Chart(document.getElementById('grad-chart'), {
+    type: 'line',
+    data: {
+        labels: [],
+        datasets: [
+            { label: 'Total', data: [], borderColor: '#e2e4ec', borderWidth: 1.5, pointRadius: 0, tension: 0.1 },
+            { label: 'Attn', data: [], borderColor: '#00d4ff', borderWidth: 1, pointRadius: 0, tension: 0.1 },
+            { label: 'FFN', data: [], borderColor: '#00ff88', borderWidth: 1, pointRadius: 0, tension: 0.1 },
+            { label: 'Embed', data: [], borderColor: '#bd00ff', borderWidth: 1, pointRadius: 0, tension: 0.1 },
+        ]
+    },
+    options: {
+        ...chartDefaults,
+        plugins: {
+            legend: { display: true, position: 'bottom',
+                labels: { color: '#4a4e63', font: { size: 8, family: 'Fira Code' }, boxWidth: 8, padding: 6 } }
+        }
+    }
+});
+
+let timingStepCounter = 0;
+
+// ═══════════════════════════════════════════════════════════════
+// Event Handlers
+// ═══════════════════════════════════════════════════════════════
+
+socket.on('init', (d) => {
+    // Restore state
+    updateStatus(d);
+    updateModelInfo(d);
+    // Replay history
+    if (d.loss_history) d.loss_history.forEach(h => pushLoss(h.step, h.loss));
+    if (d.timing_history) d.timing_history.forEach(t => pushTiming(t));
+    if (d.grad_history) d.grad_history.forEach(g => pushGrad(g));
+    if (d.log_lines) {
+        const panel = document.getElementById('log-panel');
+        panel.innerHTML = '';
+        d.log_lines.forEach(l => appendLog(l.line, l.type));
+    }
+    lossChart.update(); timingChart.update(); gradChart.update();
+});
+
+socket.on('step', (d) => {
+    pushLoss(d.step, d.loss);
+    lossChart.update();
+    document.getElementById('info-step').textContent = d.step;
+    document.getElementById('info-loss').textContent = d.loss.toFixed(4);
+    document.getElementById('info-lr').textContent = d.lr.toExponential(2);
+    document.getElementById('gauge-toksec').textContent = Math.round(d.tok_sec);
+    document.getElementById('gauge-msstep').textContent = d.ms_step.toFixed(1);
+});
+
+socket.on('timing', (d) => {
+    pushTiming(d);
+    timingChart.update();
+    const total = Object.values(d).reduce((a, b) => a + b, 0);
+    const anePct = total > 0 ? ((d.ane_fwd + d.ane_bwd) / total * 100) : 0;
+    document.getElementById('gauge-anepct').textContent = anePct.toFixed(0) + '%';
+    document.getElementById('ane-bar').style.width = anePct + '%';
+    document.getElementById('ane-bar-label').textContent =
+        `ANE ${(d.ane_fwd + d.ane_bwd).toFixed(0)}ms / Total ${total.toFixed(0)}ms`;
+});
+
+socket.on('grad_norm', (d) => {
+    pushGrad(d);
+    gradChart.update();
+});
+
+socket.on('adam', (d) => {
+    document.getElementById('info-adam').textContent = d.ms.toFixed(0) + 'ms';
+});
+
+socket.on('checkpoint', (d) => {
+    document.getElementById('info-best').textContent = d.best_loss.toFixed(4);
+});
+
+socket.on('status', (d) => {
+    const dot = document.getElementById('status-dot');
+    if (d.state === 'running') {
+        dot.className = 'dot dot-running';
+        document.getElementById('btn-start').style.display = 'none';
+        document.getElementById('btn-stop').style.display = 'flex';
+    } else if (d.state === 'compiling') {
+        dot.className = 'dot dot-compiling';
+        document.getElementById('btn-start').style.display = 'none';
+        document.getElementById('btn-stop').style.display = 'flex';
+    } else {
+        dot.className = connected ? 'dot dot-connected' : 'dot dot-disconnected';
+        document.getElementById('btn-start').style.display = 'flex';
+        document.getElementById('btn-stop').style.display = 'none';
+    }
+});
+
+socket.on('log', (d) => { appendLog(d.line, d.type); });
+
+// ═══════════════════════════════════════════════════════════════
+// Chart helpers
+// ═══════════════════════════════════════════════════════════════
+
+function pushLoss(step, loss) {
+    const ds = lossChart.data;
+    ds.labels.push(step);
+    ds.datasets[0].data.push(loss);
+    if (ds.labels.length > 2000) { ds.labels.shift(); ds.datasets[0].data.shift(); }
+}
+
+function pushTiming(t) {
+    timingStepCounter++;
+    const ds = timingChart.data;
+    ds.labels.push(timingStepCounter);
+    timingComponents.forEach((c, i) => {
+        ds.datasets[i].data.push(t[c.key] || 0);
+    });
+    if (ds.labels.length > 50) {
+        ds.labels.shift();
+        ds.datasets.forEach(d => d.data.shift());
+    }
+}
+
+function pushGrad(g) {
+    const ds = gradChart.data;
+    ds.labels.push(ds.labels.length);
+    ds.datasets[0].data.push(g.total);
+    ds.datasets[1].data.push(g.attn);
+    ds.datasets[2].data.push(g.ffn);
+    ds.datasets[3].data.push(g.embed);
+    if (ds.labels.length > 500) {
+        ds.labels.shift();
+        ds.datasets.forEach(d => d.data.shift());
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Log terminal
+// ═══════════════════════════════════════════════════════════════
+
+function appendLog(line, type) {
+    const panel = document.getElementById('log-panel');
+    const el = document.createElement('div');
+    el.className = 'log-' + (type || 'info');
+    el.textContent = line;
+    panel.appendChild(el);
+    if (panel.children.length > 500) panel.removeChild(panel.firstChild);
+    panel.scrollTop = panel.scrollHeight;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// UI helpers
+// ═══════════════════════════════════════════════════════════════
+
+function updateStatus(d) {
+    if (d.step) document.getElementById('info-step').textContent = d.step;
+    if (d.loss) document.getElementById('info-loss').textContent = d.loss.toFixed(4);
+    if (d.best_loss < 999) document.getElementById('info-best').textContent = d.best_loss.toFixed(4);
+    if (d.lr) document.getElementById('info-lr').textContent = d.lr.toExponential(2);
+    if (d.tok_sec) document.getElementById('gauge-toksec').textContent = Math.round(d.tok_sec);
+    if (d.ms_step) document.getElementById('gauge-msstep').textContent = d.ms_step.toFixed(1);
+    if (d.ane_pct) {
+        document.getElementById('gauge-anepct').textContent = d.ane_pct.toFixed(0) + '%';
+        document.getElementById('ane-bar').style.width = d.ane_pct + '%';
+    }
+    if (d.adam_ms) document.getElementById('info-adam').textContent = d.adam_ms.toFixed(0) + 'ms';
+    // Button state
+    const isRunning = d.status === 'running' || d.status === 'compiling';
+    document.getElementById('btn-start').style.display = isRunning ? 'none' : 'flex';
+    document.getElementById('btn-stop').style.display = isRunning ? 'flex' : 'none';
+    const dot = document.getElementById('status-dot');
+    if (d.status === 'running') dot.className = 'dot dot-running';
+    else if (d.status === 'compiling') dot.className = 'dot dot-compiling';
+    else dot.className = connected ? 'dot dot-connected' : 'dot dot-disconnected';
+}
+
+function updateModelInfo(d) {
+    if (d.model_name) document.getElementById('info-model').textContent = d.model_name;
+    if (d.params_m) document.getElementById('info-params').textContent = d.params_m.toFixed(1) + 'M';
+    if (d.kernels) document.getElementById('info-kernels').textContent = d.kernels + ' compiled';
+    if (d.total_flops_m) document.getElementById('info-flops').textContent = (d.total_flops_m / 1000).toFixed(0) + 'B';
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Controls
+// ═══════════════════════════════════════════════════════════════
+
+function startTraining() {
+    const model = document.getElementById('ctrl-model').value;
+    const mode = document.querySelector('input[name="mode"]:checked').value;
+    const data = {
+        model: model,
+        resume: mode === 'resume',
+        steps: document.getElementById('ctrl-steps').value || null,
+        lr: document.getElementById('ctrl-lr').value || null,
+        accum: document.getElementById('ctrl-accum').value || null,
+        warmup: document.getElementById('ctrl-warmup').value || null,
+        clip: document.getElementById('ctrl-clip').value || null,
+    };
+    socket.emit('start', data);
+}
+
+function stopTraining() {
+    socket.emit('stop');
+}
+</script>
+</body>
+</html>
